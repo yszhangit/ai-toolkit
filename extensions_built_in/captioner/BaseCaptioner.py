@@ -43,6 +43,14 @@ class CaptionConfig:
         self.caption_prompt = kwargs.get(
             "caption_prompt", "Describe this image in detail."
         )
+        # Generation/sampling params. Left as None means "don't pass it" so the
+        # model's bundled generation_config.json default applies. Set any of them
+        # (from the UI or a config file) to override.
+        self.temperature = kwargs.get("temperature", None)
+        self.top_p = kwargs.get("top_p", None)
+        self.top_k = kwargs.get("top_k", None)
+        self.repetition_penalty = kwargs.get("repetition_penalty", None)
+        self.do_sample = kwargs.get("do_sample", None)
 
 
 class BaseCaptioner(BaseExtensionProcess):

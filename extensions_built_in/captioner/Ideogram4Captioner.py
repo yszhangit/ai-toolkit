@@ -198,9 +198,7 @@ class Ideogram4Captioner(Qwen3VLCaptioner):
             )
             inputs = inputs.to(self.device_torch)
 
-            generated_ids = self.model.generate(
-                **inputs, max_new_tokens=self.caption_config.max_new_tokens
-            )
+            generated_ids = self.model.generate(**inputs, **self.build_gen_kwargs())
             generated_ids_trimmed = [
                 out_ids[len(in_ids) :]
                 for in_ids, out_ids in zip(inputs.input_ids, generated_ids)

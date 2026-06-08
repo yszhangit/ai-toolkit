@@ -49,6 +49,30 @@ class Qwen3VLCaptioner(BaseCaptioner):
             self.model.to(self.device_torch)
         flush()
 
+    def build_gen_kwargs(self) -> dict:
+        """Assemble generate() kwargs from config. Only includes sampling params
+        that were explicitly set, so unset ones fall back to the model's bundled
+        generation_config.json defaults."""
+        cfg = self.caption_config
+        gen_kwargs = {"max_new_tokens": cfg.max_new_tokens}
+        if cfg.temperature is not None:
+            gen_kwargs["temperature"] = cfg.temperature
+        if cfg.top_p is not None:
+            gen_kwargs["top_p"] = cfg.top_p
+        if cfg.top_k is not None:
+            gen_kwargs["top_k"] = cfg.top_k
+        if cfg.repetition_penalty is not None:
+            gen_kwargs["repetition_penalty"] = cfg.repetition_penalty
+        if cfg.do_sample is not None:
+            gen_kwargs["do_sample"] = cfg.do_sample
+        elif any(
+            getattr(cfg, p) is not None for p in ("temperature", "top_p", "top_k")
+        ):
+            # Setting a sampling param without do_sample triggers a warning and
+            # is ignored under greedy decoding, so enable sampling implicitly.
+            gen_kwargs["do_sample"] = True
+        return gen_kwargs
+
     def get_caption_for_file(self, file_path: str) -> str:
         img = self.load_pil_image(file_path, max_res=self.caption_config.max_res)
         try:
@@ -76,9 +100,7 @@ class Qwen3VLCaptioner(BaseCaptioner):
             inputs = inputs.to(self.device_torch)
 
             # Inference: Generation of the output
-            generated_ids = self.model.generate(
-                **inputs, max_new_tokens=self.caption_config.max_new_tokens
-            )
+            generated_ids = self.model.generate(**inputs, **self.build_gen_kwargs())
             generated_ids_trimmed = [
                 out_ids[len(in_ids) :]
                 for in_ids, out_ids in zip(inputs.input_ids, generated_ids)

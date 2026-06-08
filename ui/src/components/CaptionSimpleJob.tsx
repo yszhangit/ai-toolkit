@@ -1,12 +1,14 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Checkbox,
   CreatableSelectInput,
   FormGroup,
+  NumberInput,
   SelectInput,
   TextAreaInput,
   TextInput,
 } from '@/components/formInputs';
+import { apiClient } from '@/utils/api';
 import { CaptionJobConfig } from '@/types';
 import { handleCaptionerTypeChange } from '@/helpers/captionJobConfig';
 import {
@@ -32,6 +34,29 @@ const CaptionSimpleJob: React.FC<Props> = ({ jobConfig, setJobConfig, gpuIDs, se
   const additionalSections = selectedCaptionOption?.additionalSections || [];
   const minNewTokens = selectedCaptionOption?.minNewTokens ?? 0;
   const newTokensOptions = maxNewTokensOptions.filter(option => parseInt(option.value) >= minNewTokens);
+  const caption = jobConfig.config.process[0].caption;
+
+  // User-authored system prompts from the caption_prompts/ folder.
+  const [savedPrompts, setSavedPrompts] = useState<{ title: string; filename: string }[]>([]);
+  useEffect(() => {
+    if (!additionalSections.includes('caption.caption_prompt')) return;
+    apiClient
+      .get('/api/caption/prompts')
+      .then(res => setSavedPrompts(Array.isArray(res.data) ? res.data : []))
+      .catch(() => setSavedPrompts([]));
+  }, [additionalSections.includes('caption.caption_prompt')]);
+
+  const loadSavedPrompt = (title: string) => {
+    if (!title) return;
+    apiClient
+      .get(`/api/caption/prompts?name=${encodeURIComponent(title)}`)
+      .then(res => {
+        if (typeof res.data?.content === 'string') {
+          setJobConfig(res.data.content.trim(), 'config.process[0].caption.caption_prompt');
+        }
+      })
+      .catch(error => console.error('Error loading saved prompt:', error));
+  };
 
   return (
     <div className="text-sm text-gray-400">
@@ -181,16 +206,69 @@ const CaptionSimpleJob: React.FC<Props> = ({ jobConfig, setJobConfig, gpuIDs, se
           </FormGroup>
         </div>
       </div>
+      {additionalSections.includes('caption.gen_params') && (
+        <div className="mt-4">
+          <FormGroup label="Sampling Parameters">
+            <p className="text-xs text-gray-500 mb-2">
+              Leave a field blank to use the model&apos;s built-in default.
+            </p>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <NumberInput
+                label="Temperature"
+                value={caption.temperature ?? null}
+                min={0}
+                onChange={value => setJobConfig(value, 'config.process[0].caption.temperature')}
+                placeholder="default"
+              />
+              <NumberInput
+                label="Top P"
+                value={caption.top_p ?? null}
+                min={0}
+                max={1}
+                onChange={value => setJobConfig(value, 'config.process[0].caption.top_p')}
+                placeholder="default"
+              />
+              <NumberInput
+                label="Top K"
+                value={caption.top_k ?? null}
+                min={0}
+                onChange={value => setJobConfig(value, 'config.process[0].caption.top_k')}
+                placeholder="default"
+              />
+              <NumberInput
+                label="Repetition Penalty"
+                value={caption.repetition_penalty ?? null}
+                min={0}
+                onChange={value => setJobConfig(value, 'config.process[0].caption.repetition_penalty')}
+                placeholder="default"
+              />
+            </div>
+          </FormGroup>
+        </div>
+      )}
       {additionalSections.includes('caption.caption_prompt') && (
         <div className="mt-4">
-          <TextAreaInput
-            label="Caption Prompt"
-            value={jobConfig.config.process[0].caption.caption_prompt || ''}
-            onChange={value => {
-              setJobConfig(value, 'config.process[0].caption.caption_prompt');
-            }}
-            placeholder="Enter caption prompt"
-          />
+          {savedPrompts.length > 0 && (
+            <SelectInput
+              label="Load System Prompt"
+              value=""
+              onChange={value => loadSavedPrompt(value)}
+              options={[
+                { value: '', label: '- Select a saved prompt -' },
+                ...savedPrompts.map(p => ({ value: p.title, label: p.title })),
+              ]}
+            />
+          )}
+          <div className="mt-2">
+            <TextAreaInput
+              label="Caption Prompt"
+              value={caption.caption_prompt || ''}
+              onChange={value => {
+                setJobConfig(value, 'config.process[0].caption.caption_prompt');
+              }}
+              placeholder="Enter caption prompt"
+            />
+          </div>
         </div>
       )}
     </div>

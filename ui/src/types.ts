@@ -271,6 +271,11 @@ export interface CaptionProcessConfig {
     caption_prompt?: string;
     max_res?: number;
     max_new_tokens?: number;
+    temperature?: number | null;
+    top_p?: number | null;
+    top_k?: number | null;
+    repetition_penalty?: number | null;
+    do_sample?: boolean | null;
     fixed_caption?: string;
     caption_extension?: string;
   }

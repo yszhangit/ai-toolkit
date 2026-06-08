@@ -1,7 +1,21 @@
 import { GroupedSelectOption, SelectOption } from "@/types";
 
 type CaptionGroup = 'image' | 'music';
-type AdditionalSections = 'caption.model_name_or_path2' | 'caption.caption_prompt' | 'caption.max_res' | 'caption.max_new_tokens' | 'caption.fixed_caption';
+type AdditionalSections = 'caption.model_name_or_path2' | 'caption.caption_prompt' | 'caption.max_res' | 'caption.max_new_tokens' | 'caption.gen_params' | 'caption.fixed_caption';
+
+// Qwen3-VL sampling preset, loaded into the job when the model is selected.
+// These are user-tunable starting points (seeded from Qwen3-VL-Instruct's
+// https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct
+// generation_config defaults). Edit the values here to change what pre-fills a
+// new Qwen3-VL caption job. Any field can still be overridden per-job in the UI.
+export const qwen3vlPreset = {
+    max_res: 1024,
+    max_new_tokens: 2048,
+    temperature: 0.2,
+    top_p: 0.8,
+    top_k: 20,
+    repetition_penalty: 1.05,
+};
 
 export interface CaptionOption {
     name: string;
@@ -58,9 +72,12 @@ export const captionerTypes: CaptionOption[] = [
             'config.process[0].caption.model_name_or_path': ['Qwen/Qwen3-VL-8B-Instruct', defaultNameOrPath],
             'config.process[0].caption.extensions': [extensionsImage, defaultExtensions],
             'config.process[0].caption.caption_prompt': [defaultImageCaptionPrompt, undefined],
-            'config.process[0].caption.max_res': [512, undefined],
-            'config.process[0].caption.max_new_tokens': [128, undefined],
-
+            'config.process[0].caption.max_res': [qwen3vlPreset.max_res, undefined],
+            'config.process[0].caption.max_new_tokens': [qwen3vlPreset.max_new_tokens, undefined],
+            'config.process[0].caption.temperature': [qwen3vlPreset.temperature, undefined],
+            'config.process[0].caption.top_p': [qwen3vlPreset.top_p, undefined],
+            'config.process[0].caption.top_k': [qwen3vlPreset.top_k, undefined],
+            'config.process[0].caption.repetition_penalty': [qwen3vlPreset.repetition_penalty, undefined],
         },
         name_or_path_options: [
             { value: 'Qwen/Qwen3-VL-2B-Instruct', label: 'Qwen/Qwen3-VL-2B-Instruct' },
@@ -72,6 +89,7 @@ export const captionerTypes: CaptionOption[] = [
             'caption.caption_prompt',
             'caption.max_res',
             'caption.max_new_tokens',
+            'caption.gen_params',
         ],
     },
     {
