@@ -17,6 +17,15 @@ export const qwen3vlPreset = {
     repetition_penalty: 1.05,
 };
 
+// Ideogram4 emits structured JSON, so it wants a lower, more deterministic
+// sampling preset than the free-form Qwen3-VL captioner. Same edit-here pattern.
+export const ideogram4Preset = {
+    temperature: 0.1,
+    top_p: 0.7,
+    top_k: 20,
+    repetition_penalty: 1.05,
+};
+
 export interface CaptionOption {
     name: string;
     label: string;
@@ -105,6 +114,10 @@ export const captionerTypes: CaptionOption[] = [
             'config.process[0].caption.caption_prompt': [defaultIdeogramCaptionPrompt, undefined],
             'config.process[0].caption.max_res': [512, undefined],
             'config.process[0].caption.max_new_tokens': [4096, undefined],
+            'config.process[0].caption.temperature': [ideogram4Preset.temperature, undefined],
+            'config.process[0].caption.top_p': [ideogram4Preset.top_p, undefined],
+            'config.process[0].caption.top_k': [ideogram4Preset.top_k, undefined],
+            'config.process[0].caption.repetition_penalty': [ideogram4Preset.repetition_penalty, undefined],
         },
         name_or_path_options: [
             { value: 'Qwen/Qwen3-VL-2B-Instruct', label: 'Qwen/Qwen3-VL-2B-Instruct' },
@@ -116,6 +129,7 @@ export const captionerTypes: CaptionOption[] = [
             'caption.caption_prompt',
             'caption.max_res',
             'caption.max_new_tokens',
+            'caption.gen_params',
         ],
     },
 

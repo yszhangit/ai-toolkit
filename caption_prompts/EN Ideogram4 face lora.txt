@@ -1,0 +1,30 @@
+This dataset trains a character/face LoRA on a single recurring subject. Caption each image so the subject's fixed identity (the face) BAKES INTO the model, while everything you want to remain editable at generation time is written into the JSON.
+
+The baking principle: what you DESCRIBE stays flexible/variable; what you leave UNDESCRIBED is learned as a constant from the pixels. So describe the variable context richly, and stay silent on the permanent facial identity. Your reader is a text encoder, not a person.
+
+Apply all of this WITHIN the fixed OUTPUT CONTRACT — do not change the JSON structure, the three top-level keys, their order, the bbox format, or the observe-only rule. This is dataset guidance, not a new format.
+
+SUBJECT IDENTITY
+- Refer to the subject generically by apparent category only (e.g. `a woman`, `a young man`). Do NOT name a real person or guess an identity, even if the face seems familiar.
+- The recurring subject is ONE `obj` element, as the contract requires. Do not split the person into parts.
+
+IN THE SUBJECT'S ELEMENT `desc`, DESCRIBE IN DETAIL (these must stay editable, so they MUST be captioned):
+- Hair: length, cut, parting, texture, and how it is worn or tied, plus any headwear or hair accessories.
+- Every visible garment and accessory with its color and material — top, bottom, outerwear, jewelry, glasses, hat, bag. Be specific so a single recurring outfit does not bake into the character.
+- Facial expression and the emotion it reads as.
+- Gaze direction and head angle/pose (e.g. `looking slightly off to the left, head tilted down`).
+- The subject's pose and how they are framed (head-and-shoulders, half body, full body).
+
+IN THE SUBJECT'S ELEMENT `desc`, DO NOT STATE these permanent face-identity attributes (leave them undescribed so they bake in):
+- Face shape (`round face`, `oval face`, `long face`).
+- Eye color and eye shape (`blue eyes`, `almond eyes`).
+- Bone structure (`high cheekbones`, `sharp jawline`, `pointed chin`).
+- Nose, lip, and brow geometry, and permanent identifying facial marks (moles, freckles, birthmarks) that belong to the identity.
+- A fixed skin-tone identity label. You may describe how light falls on the skin, but do not pin the complexion as an identity trait.
+
+EVERYTHING ELSE FOLLOWS THE CONTRACT NORMALLY
+- `style_description` (aesthetics, lighting, photo, medium, color_palette) and `background` describe the scene as usual — lighting, composition, and setting belong here, stated concretely and decisively.
+- `high_level_description` stays a short observational summary that starts with the subject.
+- Keep all prose in English; transcribe any on-image text verbatim in `text` elements per the contract.
+
+The more thoroughly a garment, hairstyle, or accessory is captioned, the less it bakes into the character — so when one is prominent or recurs across the dataset, describe it in even more detail.
