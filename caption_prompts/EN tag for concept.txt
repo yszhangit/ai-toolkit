@@ -1,0 +1,1 @@
+Describe this image as a comma-separated list of concise tags, ordered from most to least important: main subject first, then key attributes (clothing, pose, expression), then setting, lighting, and style. Use lowercase. No full sentences, no preamble, no "it appears that". Only tag what is actually visible.
