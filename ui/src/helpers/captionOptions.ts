@@ -1,10 +1,7 @@
 import { GroupedSelectOption, SelectOption } from "@/types";
 
 type CaptionGroup = 'image' | 'music';
-<<<<<<< HEAD
-type AdditionalSections = 'caption.model_name_or_path2' | 'caption.caption_prompt' | 'caption.max_res' | 'caption.max_new_tokens' | 'caption.fixed_caption' | 'caption.thinking';
-=======
-type AdditionalSections = 'caption.model_name_or_path2' | 'caption.caption_prompt' | 'caption.max_res' | 'caption.max_new_tokens' | 'caption.gen_params' | 'caption.fixed_caption';
+type AdditionalSections = 'caption.model_name_or_path2' | 'caption.caption_prompt' | 'caption.max_res' | 'caption.max_new_tokens' | 'caption.gen_params' | 'caption.fixed_caption' | 'caption.thinking';
 
 // Qwen3-VL sampling preset, loaded into the job when the model is selected.
 // These are user-tunable starting points (seeded from Qwen3-VL-Instruct's
@@ -19,7 +16,6 @@ export const qwen3vlPreset = {
     top_k: 20,
     repetition_penalty: 1.05,
 };
->>>>>>> 22ea75d (Add Qwen3-VL sampling presets and selectable system prompts to captioner)
 
 export interface CaptionOption {
     name: string;
@@ -96,11 +92,8 @@ export const captionerTypes: CaptionOption[] = [
             'caption.caption_prompt',
             'caption.max_res',
             'caption.max_new_tokens',
-<<<<<<< HEAD
-            'caption.thinking',
-=======
             'caption.gen_params',
->>>>>>> 22ea75d (Add Qwen3-VL sampling presets and selectable system prompts to captioner)
+            'caption.thinking',
         ],
     },
     {

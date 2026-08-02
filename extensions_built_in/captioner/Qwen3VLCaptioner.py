@@ -159,7 +159,7 @@ class Qwen3VLCaptioner(BaseCaptioner):
             )
             inputs = inputs.to(self.device_torch)
 
-            gen_kwargs = {"max_new_tokens": self.caption_config.max_new_tokens}
+            gen_kwargs = self.build_gen_kwargs()
             if self.caption_config.thinking:
                 think_end_token_id = self.processor.tokenizer.convert_tokens_to_ids(
                     "</think>"
@@ -167,25 +167,20 @@ class Qwen3VLCaptioner(BaseCaptioner):
                 if think_end_token_id is not None:
                     # give the model room to think, but start the max_new_tokens
                     # budget only once the think block closes
-                    gen_kwargs = {
-                        "max_new_tokens": MAX_THINKING_TOKENS
-                        + self.caption_config.max_new_tokens,
-                        "stopping_criteria": StoppingCriteriaList(
-                            [
-                                ThinkingBudgetCriteria(
-                                    think_end_token_id,
-                                    self.caption_config.max_new_tokens,
-                                )
-                            ]
-                        ),
-                    }
+                    gen_kwargs["max_new_tokens"] = (
+                        MAX_THINKING_TOKENS + self.caption_config.max_new_tokens
+                    )
+                    gen_kwargs["stopping_criteria"] = StoppingCriteriaList(
+                        [
+                            ThinkingBudgetCriteria(
+                                think_end_token_id,
+                                self.caption_config.max_new_tokens,
+                            )
+                        ]
+                    )
 
             # Inference: Generation of the output
-<<<<<<< HEAD
             generated_ids = self.model.generate(**inputs, **gen_kwargs)
-=======
-            generated_ids = self.model.generate(**inputs, **self.build_gen_kwargs())
->>>>>>> 22ea75d (Add Qwen3-VL sampling presets and selectable system prompts to captioner)
             generated_ids_trimmed = [
                 out_ids[len(in_ids) :]
                 for in_ids, out_ids in zip(inputs.input_ids, generated_ids)

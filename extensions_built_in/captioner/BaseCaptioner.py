@@ -44,9 +44,7 @@ class CaptionConfig:
         self.caption_prompt = kwargs.get(
             "caption_prompt", "Describe this image in detail."
         )
-<<<<<<< HEAD
         self.compile = kwargs.get("compile", False)
-=======
         # Generation/sampling params. Left as None means "don't pass it" so the
         # model's bundled generation_config.json default applies. Set any of them
         # (from the UI or a config file) to override.
@@ -55,7 +53,6 @@ class CaptionConfig:
         self.top_k = kwargs.get("top_k", None)
         self.repetition_penalty = kwargs.get("repetition_penalty", None)
         self.do_sample = kwargs.get("do_sample", None)
->>>>>>> 22ea75d (Add Qwen3-VL sampling presets and selectable system prompts to captioner)
 
 
 class BaseCaptioner(BaseExtensionProcess):
