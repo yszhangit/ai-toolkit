@@ -131,6 +131,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 training_folder=self.training_folder,
                 job_name=self.job.name,
                 log_fn=print_acc,
+                save_root=self.save_root,
+                sample_prompts_count=len(self.sample_config.prompts),
             )
         first_sample_config = self.get_conf('first_sample', None)
         if first_sample_config is not None:

@@ -71,11 +71,23 @@ def _ws_server_frame(opcode: int, payload: bytes, fin: bool = True) -> bytes:
 
 
 class _MockComfyServer:
-    """Minimal mock ComfyUI server speaking HTTP /prompt and RFC 6455 /ws?clientId=... on one port."""
+    """Minimal mock ComfyUI server speaking HTTP (/prompt, /system_stats, /object_info) and RFC 6455 /ws."""
 
-    def __init__(self, fail_first_n_not_in_list: int = 0, use_metadata_event: bool = False):
+    def __init__(
+        self,
+        fail_first_n_not_in_list: int = 0,
+        use_metadata_event: bool = False,
+        loras_root: str = "",
+        loras_prefix: str = "",
+        extra_object_info: Dict = None,
+        missing_classes: set = None,
+    ):
         self.fail_first_n = fail_first_n_not_in_list
         self.use_metadata_event = use_metadata_event
+        self.loras_root = loras_root
+        self.loras_prefix = loras_prefix.strip("/\\")
+        self.extra_object_info = extra_object_info or {}
+        self.missing_classes = set(missing_classes or ())
         self.submitted_workflows: List[Dict] = []
         self._lock = threading.Lock()
         self._ws_clients: Dict[str, socket.socket] = {}
@@ -88,6 +100,41 @@ class _MockComfyServer:
         self._sock.settimeout(0.2)
         self._thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._thread.start()
+
+    def _scan_loras(self) -> List[str]:
+        if not self.loras_root or not os.path.isdir(self.loras_root):
+            return []
+        found = []
+        for root, _, files in os.walk(self.loras_root):
+            for fn in files:
+                if fn.endswith(".safetensors"):
+                    rel = os.path.relpath(os.path.join(root, fn), self.loras_root).replace("\\", "/")
+                    found.append(f"{self.loras_prefix}/{rel}" if self.loras_prefix else rel)
+        return sorted(found)
+
+    def _object_info_for(self, cls: str) -> Dict:
+        if cls in self.missing_classes:
+            return {}
+        if cls in self.extra_object_info:
+            return {cls: self.extra_object_info[cls]}
+        if cls in ("LoraLoader", "LoraLoaderModelOnly"):
+            return {
+                cls: {
+                    "input": {
+                        "required": {
+                            "lora_name": [self._scan_loras()],
+                            "strength_model": ["FLOAT", {"default": 1.0}],
+                        }
+                    }
+                }
+            }
+        if cls == "SaveImageWebsocket":
+            return {cls: {"input": {"required": {"images": ["IMAGE"]}}}}
+        if cls == "UNETLoader":
+            return {cls: {"input": {"required": {"unet_name": [["model_a.safetensors"]], "weight_dtype": [["default"]]}}}}
+        if cls == "QwenImage21Cache":
+            return {cls: {"input": {"required": {"device": ["COMBO", {"options": ["auto", "cpu"]}], "dtype": ["COMBO", {"options": ["default"]}]}}}}
+        return {cls: {"input": {"required": {}}}}
 
     @property
     def url(self) -> str:
@@ -150,6 +197,34 @@ class _MockComfyServer:
                 # Keep socket open until client closes or server stops.
                 while not self._stop.is_set():
                     time.sleep(0.05)
+                return
+
+            if method == "GET" and target == "/system_stats":
+                ok_body = json.dumps(
+                    {
+                        "system": {"comfyui_version": "0.45.0-mock"},
+                        "devices": [{"name": "cuda:0 Mock GPU"}],
+                    }
+                ).encode("utf-8")
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/json\r\n"
+                    + f"Content-Length: {len(ok_body)}\r\nConnection: close\r\n\r\n".encode("ascii")
+                    + ok_body
+                )
+                conn.close()
+                return
+
+            if method == "GET" and target.startswith("/object_info/"):
+                cls = target[len("/object_info/") :].split("?", 1)[0]
+                ok_body = json.dumps(self._object_info_for(cls)).encode("utf-8")
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/json\r\n"
+                    + f"Content-Length: {len(ok_body)}\r\nConnection: close\r\n\r\n".encode("ascii")
+                    + ok_body
+                )
+                conn.close()
                 return
 
             if method == "POST" and target == "/prompt":
@@ -342,17 +417,22 @@ class TestRemoteComfyUISampler(unittest.TestCase):
         self.assertEqual(extract_ws_image_bytes(frame4), png)
 
     def test_end_to_end_streaming_with_sshfs_retry_and_fragmentation(self):
-        server = _MockComfyServer(fail_first_n_not_in_list=2, use_metadata_event=False)
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                output_root = os.path.join(tmp, "output")
-                job_dir = os.path.join(output_root, "my_job")
-                samples_dir = os.path.join(job_dir, "samples")
-                os.makedirs(job_dir, exist_ok=True)
-                lora_file = os.path.join(job_dir, "my_job_000000200.safetensors")
-                with open(lora_file, "wb") as f:
-                    f.write(b"fake")
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = os.path.join(tmp, "output")
+            job_dir = os.path.join(output_root, "my_job")
+            samples_dir = os.path.join(job_dir, "samples")
+            os.makedirs(job_dir, exist_ok=True)
+            lora_file = os.path.join(job_dir, "my_job_000000200.safetensors")
+            with open(lora_file, "wb") as f:
+                f.write(b"fake")
 
+            server = _MockComfyServer(
+                fail_first_n_not_in_list=2,
+                use_metadata_event=False,
+                loras_root=output_root,
+                loras_prefix="aitk_output",
+            )
+            try:
                 wf_path = os.path.join(tmp, "workflow_api.json")
                 with open(wf_path, "w", encoding="utf-8") as f:
                     json.dump(
@@ -373,10 +453,22 @@ class TestRemoteComfyUISampler(unittest.TestCase):
                     lora_wait_retries=3,
                     lora_wait_interval=0.05,
                     request_timeout=10.0,
+                    preflight_check="strict",
+                    preflight_sshfs_probe=True,
                 )
                 logs: List[str] = []
-                sampler = RemoteComfyUISampler(cfg, training_folder=output_root, job_name="my_job", log_fn=logs.append)
+                sampler = RemoteComfyUISampler(
+                    cfg,
+                    training_folder=output_root,
+                    job_name="my_job",
+                    log_fn=logs.append,
+                    save_root=job_dir,
+                    sample_prompts_count=2,
+                )
                 try:
+                    self.assertTrue(sampler.preflight_report["ok"])
+                    # Ensure sentinel probe file was cleaned up immediately.
+                    self.assertEqual([fn for fn in os.listdir(job_dir) if "_aitk_remote_probe_" in fn], [])
                     c0 = _DummyGenConfig(samples_dir, 200, "portrait 1", seed=42)
                     c1 = _DummyGenConfig(samples_dir, 200, "portrait 2", seed=43)
                     sampler.enqueue(200, lora_file, [c0, c1])
@@ -396,8 +488,97 @@ class TestRemoteComfyUISampler(unittest.TestCase):
                     img = Image.open(c.saved_paths[0])
                     self.assertEqual(img.size, (48, 32))
                     self.assertEqual(img.getpixel((0, 0)), ((seed * 37) % 256, 128, 64))
-        finally:
-            server.close()
+            finally:
+                server.close()
+
+    def test_preflight_catches_errors_and_respects_modes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = os.path.join(tmp, "output")
+            job_dir = os.path.join(output_root, "my_job")
+            os.makedirs(job_dir, exist_ok=True)
+            wf_path = os.path.join(tmp, "wf.json")
+            with open(wf_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "4": {"class_type": "QwenImage21Cache", "inputs": {"device": "auto", "dtype": "default"}},
+                        "5": {"class_type": "UNETLoader", "inputs": {"unet_name": "missing_model.safetensors", "weight_dtype": "default"}},
+                        "10": {"class_type": "LoraLoaderModelOnly", "inputs": {"lora_name": "{{lora_name}}", "strength_model": "{{lora_strength}}"}},
+                        "9": {"class_type": "SaveImageWebsocket", "inputs": {"images": ["8", 0]}},
+                    },
+                    f,
+                )
+
+            # Mount prefix intentionally mismatches server's prefix ("wrong_prefix" vs "aitk_output")
+            server = _MockComfyServer(loras_root=output_root, loras_prefix="aitk_output")
+            try:
+                cfg_strict = RemoteComfyUIConfig(
+                    enabled=True,
+                    server_url=server.url,
+                    workflow_path=wf_path,
+                    remote_lora_prefix="wrong_prefix",
+                    preflight_check="strict",
+                    preflight_sshfs_probe=True,
+                )
+                with self.assertRaises(RemoteComfyUIError) as ctx:
+                    RemoteComfyUISampler(
+                        cfg_strict,
+                        training_folder=output_root,
+                        job_name="my_job",
+                        log_fn=lambda _: None,
+                        save_root=job_dir,
+                        sample_prompts_count=0,
+                    )
+                err = str(ctx.exception)
+                self.assertIn("samples_non_empty", err)
+                self.assertIn("missing_model.safetensors", err)
+                self.assertIn("sshfs_mount_probe", err)
+                # Sentinel file must be cleaned up even when preflight raises!
+                self.assertEqual([fn for fn in os.listdir(job_dir) if "_aitk_remote_probe_" in fn], [])
+
+                # Same config in "warn" mode must succeed and record the errors in preflight_report.
+                cfg_warn = RemoteComfyUIConfig(
+                    enabled=True,
+                    server_url=server.url,
+                    workflow_path=wf_path,
+                    remote_lora_prefix="wrong_prefix",
+                    preflight_check="warn",
+                    preflight_sshfs_probe=True,
+                )
+                sampler_warn = RemoteComfyUISampler(
+                    cfg_warn,
+                    training_folder=output_root,
+                    job_name="my_job",
+                    log_fn=lambda _: None,
+                    save_root=job_dir,
+                    sample_prompts_count=0,
+                )
+                try:
+                    self.assertFalse(sampler_warn.preflight_report["ok"])
+                    self.assertGreaterEqual(len(sampler_warn.preflight_report["errors"]), 3)
+                finally:
+                    sampler_warn.stop()
+
+                # "off" mode skips preflight completely (even with an unreachable server URL).
+                cfg_off = RemoteComfyUIConfig(
+                    enabled=True,
+                    server_url="http://127.0.0.1:1",
+                    workflow_path=wf_path,
+                    preflight_check="off",
+                )
+                sampler_off = RemoteComfyUISampler(
+                    cfg_off,
+                    training_folder=output_root,
+                    job_name="my_job",
+                    log_fn=lambda _: None,
+                    save_root=job_dir,
+                    sample_prompts_count=0,
+                )
+                try:
+                    self.assertIsNone(sampler_off.preflight_report)
+                finally:
+                    sampler_off.stop()
+            finally:
+                server.close()
 
     def test_metadata_binary_event(self):
         server = _MockComfyServer(fail_first_n_not_in_list=0, use_metadata_event=True)

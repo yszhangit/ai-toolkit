@@ -67,6 +67,11 @@ class RemoteComfyUIConfig:
         # Retries when ComfyUI rejects a newly saved LoRA due to sshfs directory-cache lag
         self.lora_wait_retries: int = int(kwargs.get('lora_wait_retries', 6))
         self.lora_wait_interval: float = float(kwargs.get('lora_wait_interval', 5.0))
+        # Startup preflight verification: "strict" (fail fast), "warn" (log and continue), or "off"
+        self.preflight_check: str = str(kwargs.get('preflight_check', 'strict')).strip().lower()
+        self.preflight_timeout: float = float(kwargs.get('preflight_timeout', 10.0))
+        # Write+delete a 0-byte sentinel .safetensors in save_root to prove sshfs + remote_lora_prefix work
+        self.preflight_sshfs_probe: bool = bool(kwargs.get('preflight_sshfs_probe', True))
 
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _BINARY_EVENT_PREVIEW_IMAGE = 1
@@ -509,6 +514,30 @@ def execute_comfyui_workflow_ws(
         return images
 
 
+def _extract_combo_options(input_spec: Any) -> Optional[List[Any]]:
+    """Extract allowed option values from a ComfyUI object_info input spec (v1 list or v3 COMBO)."""
+    if not isinstance(input_spec, list) or not input_spec:
+        return None
+    first = input_spec[0]
+    if isinstance(first, list):
+        return first
+    if first == "COMBO" and len(input_spec) >= 2 and isinstance(input_spec[1], dict):
+        opts = input_spec[1].get("options")
+        if isinstance(opts, list):
+            return opts
+    return None
+
+
+def _workflow_contains_placeholder(obj: Any, token: str) -> bool:
+    if isinstance(obj, str):
+        return token in obj
+    if isinstance(obj, dict):
+        return any(_workflow_contains_placeholder(v, token) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_workflow_contains_placeholder(v, token) for v in obj)
+    return False
+
+
 class RemoteComfyUISampler:
     """Background FIFO worker that dispatches checkpoint previews to a LAN ComfyUI machine."""
 
@@ -518,10 +547,14 @@ class RemoteComfyUISampler:
         training_folder: str,
         job_name: str,
         log_fn: Callable[[str], None] = print,
+        save_root: Optional[str] = None,
+        sample_prompts_count: Optional[int] = None,
     ):
         self.config = config
         self.job_name = job_name
         self.local_root = os.path.abspath(config.local_root or training_folder)
+        self.save_root = os.path.abspath(save_root or os.path.join(training_folder, job_name))
+        self.sample_prompts_count = sample_prompts_count
         self.log_fn = log_fn
 
         if not config.workflow_path:
@@ -530,6 +563,17 @@ class RemoteComfyUISampler:
             raise FileNotFoundError(f"Remote ComfyUI workflow file not found: {config.workflow_path}")
 
         self._workflow_template: Dict[str, Any] = self._load_workflow_file()
+
+        mode = (self.config.preflight_check or "strict").strip().lower()
+        if mode not in ("strict", "warn", "off"):
+            raise ValueError(
+                f"Invalid sample.remote_comfyui.preflight_check={self.config.preflight_check!r}; "
+                "expected 'strict', 'warn', or 'off'."
+            )
+        self.preflight_report: Optional[Dict[str, Any]] = None
+        if mode != "off":
+            self.preflight_report = self.run_preflight(strict=(mode == "strict"))
+
         self._queue: "queue.Queue[Optional[Tuple[int, str, List[GenerateImageConfig]]]]" = queue.Queue()
         self._pending_lock = threading.Lock()
         self._pending_counts: Dict[str, int] = {}
@@ -545,6 +589,261 @@ class RemoteComfyUISampler:
             f"(workflow={self.config.workflow_path}, local_root={self.local_root}, "
             f"remote_lora_prefix={self.config.remote_lora_prefix!r})"
         )
+
+    def run_preflight(self, strict: bool = False) -> Dict[str, Any]:
+        """Run fast (<1s) startup validation of local config, workflow, Machine B, and sshfs mount."""
+        checks: List[Tuple[str, str, str]] = []  # (name, status, detail)
+        errors: List[str] = []
+        warnings: List[str] = []
+
+        def record(name: str, status: str, detail: str) -> None:
+            checks.append((name, status, detail))
+            if status == "FAIL":
+                errors.append(f"{name}: {detail}")
+            elif status == "WARN":
+                warnings.append(f"{name}: {detail}")
+
+        # 1. sample.samples non-empty
+        if self.sample_prompts_count is not None:
+            if self.sample_prompts_count <= 0:
+                record(
+                    "samples_non_empty",
+                    "FAIL",
+                    "sample.samples has 0 prompts (check YAML indentation so samples: is nested under sample:)",
+                )
+            else:
+                record("samples_non_empty", "PASS", f"{self.sample_prompts_count} prompt(s) configured")
+
+        # 2. node_overrides
+        overridden_wf: Optional[Dict[str, Any]] = None
+        try:
+            overridden_wf = apply_node_overrides(self._workflow_template, self.config.node_overrides)
+            record("node_overrides", "PASS", f"{len(self.config.node_overrides)} override(s) valid")
+        except Exception as e:
+            record("node_overrides", "FAIL", str(e))
+
+        # 3. WebSocket output node
+        ws_wf: Optional[Dict[str, Any]] = None
+        ws_node_ids: Set[str] = set()
+        if overridden_wf is not None:
+            ws_wf, ws_node_ids = rewrite_save_nodes_to_websocket(
+                overridden_wf, replace_save=self.config.replace_save_with_websocket
+            )
+            if ws_node_ids:
+                record("ws_output_node", "PASS", f"SaveImageWebsocket node(s): {sorted(ws_node_ids)}")
+            else:
+                record(
+                    "ws_output_node",
+                    "FAIL",
+                    "workflow has no SaveImageWebsocket (nor SaveImage/PreviewImage to rewrite)",
+                )
+
+        # 4. {{lora_name}} binding
+        if ws_wf is not None:
+            if _workflow_contains_placeholder(ws_wf, "{{lora_name}}"):
+                record("lora_placeholder", "PASS", "{{lora_name}} found in workflow")
+            else:
+                record(
+                    "lora_placeholder",
+                    "WARN",
+                    "{{lora_name}} not found in workflow or node_overrides; checkpoints will not be substituted",
+                )
+
+        # 5. Local-to-remote LoRA path mapping
+        sample_remote_lora: Optional[str] = None
+        try:
+            dummy_ckpt = os.path.join(self.save_root, f"{self.job_name}_000000001.safetensors")
+            sample_remote_lora = resolve_remote_lora_name(
+                dummy_ckpt,
+                self.local_root,
+                remote_lora_prefix=self.config.remote_lora_prefix,
+                path_separator=self.config.path_separator,
+            )
+            record("lora_path_mapping", "PASS", f"e.g. {sample_remote_lora}")
+        except Exception as e:
+            record("lora_path_mapping", "FAIL", str(e))
+
+        base_url = self.config.server_url.strip().rstrip("/")
+        timeout = max(1.0, float(self.config.preflight_timeout))
+
+        # 6. Machine B HTTP /system_stats
+        server_ok = False
+        try:
+            resp = requests.get(f"{base_url}/system_stats", timeout=timeout)
+            if resp.status_code != 200:
+                record("server_reachable", "FAIL", f"HTTP {resp.status_code} from {base_url}/system_stats")
+            else:
+                stats = resp.json()
+                ver = (stats.get("system") or {}).get("comfyui_version", "unknown")
+                devs = [d.get("name", "?") for d in (stats.get("devices") or [])]
+                dev_str = ", ".join(devs[:2]) if devs else "no devices reported"
+                record("server_reachable", "PASS", f"ComfyUI {ver} ({dev_str})")
+                server_ok = True
+        except Exception as e:
+            record("server_reachable", "FAIL", f"cannot reach {base_url}/system_stats: {e}")
+
+        # 7. Machine B WebSocket handshake
+        if server_ok:
+            ws_url = http_to_ws_url(base_url, f"preflight-{uuid.uuid4().hex[:8]}")
+            try:
+                with _StdlibWebSocket(ws_url, timeout=timeout):
+                    pass
+                record("websocket_handshake", "PASS", "WebSocket /ws upgrade succeeded")
+            except Exception as e:
+                record("websocket_handshake", "FAIL", f"WebSocket upgrade failed ({ws_url}): {e}")
+
+        # 8. Workflow node classes & static combo values (unet/clip/vae/sampler/etc.)
+        fetched_object_info: Dict[str, Dict[str, Any]] = {}
+        if server_ok and ws_wf is not None:
+            class_types = sorted(
+                {
+                    str(node.get("class_type"))
+                    for node in ws_wf.values()
+                    if isinstance(node, dict) and node.get("class_type")
+                }
+            )
+            missing_classes: List[str] = []
+            missing_choices: List[str] = []
+            for cls in class_types:
+                try:
+                    r = requests.get(f"{base_url}/object_info/{urllib.parse.quote(cls, safe='')}", timeout=timeout)
+                    info = r.json() if r.status_code == 200 else {}
+                except Exception as e:
+                    missing_classes.append(f"{cls} ({e})")
+                    continue
+                if not isinstance(info, dict) or cls not in info:
+                    missing_classes.append(cls)
+                    continue
+                fetched_object_info[cls] = info[cls]
+
+            if missing_classes:
+                record(
+                    "workflow_nodes",
+                    "FAIL",
+                    f"missing node class(es) on Machine B: {', '.join(missing_classes)}",
+                )
+            else:
+                record("workflow_nodes", "PASS", f"all {len(class_types)} node class(es) available on Machine B")
+
+            # Validate static combo inputs (e.g. unet_name, clip_name, vae_name, sampler_name)
+            for nid, node in ws_wf.items():
+                if not isinstance(node, dict):
+                    continue
+                cls = node.get("class_type")
+                cls_info = fetched_object_info.get(str(cls))
+                if not cls_info:
+                    continue
+                inp_defs = cls_info.get("input") or {}
+                all_specs: Dict[str, Any] = {}
+                for section in ("required", "optional"):
+                    sec = inp_defs.get(section)
+                    if isinstance(sec, dict):
+                        all_specs.update(sec)
+                for field, val in (node.get("inputs") or {}).items():
+                    if not isinstance(val, str) or "{{" in val:
+                        continue
+                    options = _extract_combo_options(all_specs.get(field))
+                    if options is not None and val not in options:
+                        missing_choices.append(f"node {nid} ({cls}).{field}={val!r}")
+
+            if missing_choices:
+                record(
+                    "workflow_models",
+                    "FAIL",
+                    f"value(s) not found on Machine B: {'; '.join(missing_choices)}",
+                )
+            elif not missing_classes:
+                record("workflow_models", "PASS", "all static model/combo inputs verified on Machine B")
+
+        # 9. End-to-end sshfs + remote_lora_prefix sentinel probe
+        if server_ok and self.config.preflight_sshfs_probe and sample_remote_lora is not None:
+            lora_cls = None
+            for candidate in ("LoraLoaderModelOnly", "LoraLoader"):
+                if candidate in fetched_object_info:
+                    lora_cls = candidate
+                    break
+            if lora_cls is None:
+                for candidate in ("LoraLoaderModelOnly", "LoraLoader"):
+                    try:
+                        r = requests.get(f"{base_url}/object_info/{candidate}", timeout=timeout)
+                        if r.status_code == 200 and candidate in r.json():
+                            lora_cls = candidate
+                            break
+                    except Exception:
+                        pass
+
+            if lora_cls is None:
+                record("sshfs_mount_probe", "WARN", "no LoraLoader node found on Machine B to verify sshfs mount")
+            else:
+                probe_name = f"_aitk_remote_probe_{uuid.uuid4().hex[:8]}.safetensors"
+                probe_path = os.path.join(self.save_root, probe_name)
+                expected_remote = resolve_remote_lora_name(
+                    probe_path,
+                    self.local_root,
+                    remote_lora_prefix=self.config.remote_lora_prefix,
+                    path_separator=self.config.path_separator,
+                )
+                try:
+                    os.makedirs(self.save_root, exist_ok=True)
+                    with open(probe_path, "wb"):
+                        pass
+                    found = False
+                    available: List[str] = []
+                    for attempt in range(2):
+                        r = requests.get(f"{base_url}/object_info/{lora_cls}", timeout=timeout)
+                        if r.status_code == 200:
+                            cls_data = r.json().get(lora_cls, {})
+                            req_specs = (cls_data.get("input") or {}).get("required") or {}
+                            opts = _extract_combo_options(req_specs.get("lora_name")) or []
+                            available = [str(x) for x in opts]
+                            if expected_remote in available:
+                                found = True
+                                break
+                        if attempt == 0:
+                            time.sleep(0.5)
+                    if found:
+                        record("sshfs_mount_probe", "PASS", f"Machine B saw sentinel {expected_remote!r}")
+                    else:
+                        prefix_norm = (self.config.remote_lora_prefix or "").strip().strip("/\\")
+                        same_prefix = [
+                            x for x in available if prefix_norm and x.replace("\\", "/").startswith(prefix_norm + "/")
+                        ]
+                        hint = (
+                            f"found {len(same_prefix)} LoRA(s) under prefix {prefix_norm!r} "
+                            f"(e.g. {same_prefix[:2]}) — check sshfs cache (-o cache=no) or remote_lora_prefix/local_root"
+                            if same_prefix
+                            else f"0 LoRAs found under prefix {prefix_norm!r} — check sshfs mount on Machine B and remote_lora_prefix"
+                        )
+                        record(
+                            "sshfs_mount_probe",
+                            "FAIL",
+                            f"Machine B did not see sentinel {expected_remote!r} ({hint})",
+                        )
+                except Exception as e:
+                    record("sshfs_mount_probe", "FAIL", f"sentinel probe failed: {e}")
+                finally:
+                    try:
+                        if os.path.exists(probe_path):
+                            os.remove(probe_path)
+                    except OSError:
+                        pass
+
+        # Print concise preflight summary
+        self.log_fn(f"[RemoteComfyUI] Startup preflight ({base_url}):")
+        for name, status, detail in checks:
+            self.log_fn(f"  [{status}] {name}: {detail}")
+
+        report = {
+            "ok": len(errors) == 0,
+            "checks": checks,
+            "errors": errors,
+            "warnings": warnings,
+        }
+        if errors and strict:
+            raise RemoteComfyUIError(
+                "Remote ComfyUI startup preflight failed:\n  - " + "\n  - ".join(errors)
+            )
+        return report
 
     def _load_workflow_file(self) -> Dict[str, Any]:
         with open(self.config.workflow_path, "r", encoding="utf-8") as f:
@@ -717,7 +1016,12 @@ def _cli() -> None:
     )
     parser.add_argument("--server", required=True, help="ComfyUI server URL, e.g. http://192.168.1.50:8188")
     parser.add_argument("--workflow", required=True, help="Path to ComfyUI API-format workflow.json")
-    parser.add_argument("--lora", required=True, help="LoRA name as seen by ComfyUI on Machine B")
+    parser.add_argument("--lora", default=None, help="LoRA name as seen by ComfyUI on Machine B (required unless --preflight)")
+    parser.add_argument("--preflight", action="store_true", help="Run startup preflight checks only (no image render)")
+    parser.add_argument("--local-root", default=None, help="Local output root on Machine A for --preflight sshfs probe")
+    parser.add_argument("--save-root", default=None, help="Job save_root on Machine A for --preflight sshfs probe")
+    parser.add_argument("--prefix", default="", help="remote_lora_prefix for --preflight sshfs probe")
+    parser.add_argument("--no-sshfs-probe", action="store_true", help="Skip sentinel .safetensors check during --preflight")
     parser.add_argument("--prompt", default="a portrait photo", help="Positive prompt")
     parser.add_argument("--neg", default="", help="Negative prompt")
     parser.add_argument("--seed", type=int, default=42)
@@ -728,6 +1032,31 @@ def _cli() -> None:
     parser.add_argument("--strength", type=float, default=1.0)
     parser.add_argument("--output", default="./remote_comfyui_test.png", help="Output path on Machine A")
     args = parser.parse_args()
+
+    if args.preflight:
+        local_root = os.path.abspath(args.local_root or ".")
+        save_root = os.path.abspath(args.save_root or local_root)
+        cfg = RemoteComfyUIConfig(
+            enabled=True,
+            server_url=args.server,
+            workflow_path=args.workflow,
+            remote_lora_prefix=args.prefix,
+            local_root=local_root,
+            preflight_check="strict",
+            preflight_sshfs_probe=not args.no_sshfs_probe,
+        )
+        sampler = RemoteComfyUISampler(
+            config=cfg,
+            training_folder=local_root,
+            job_name=os.path.basename(save_root) or "preflight",
+            save_root=save_root,
+            sample_prompts_count=1,
+        )
+        sampler.stop()
+        return
+
+    if not args.lora:
+        parser.error("--lora is required unless --preflight is passed")
 
     with open(args.workflow, "r", encoding="utf-8") as f:
         wf = json.load(f)

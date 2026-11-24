@@ -92,6 +92,9 @@ sample:
     request_timeout: 600
     lora_wait_retries: 6
     lora_wait_interval: 5.0
+    preflight_check: "strict"          # "strict" (fail fast on startup), "warn" (log & continue), or "off"
+    preflight_timeout: 10.0            # seconds per HTTP/WS startup check
+    preflight_sshfs_probe: true        # write+delete 0-byte sentinel .safetensors to verify sshfs & prefix
     # Optional if you prefer NOT to edit workflow.json with {{...}} placeholders:
     node_overrides:
       "10.inputs.lora_name": "{{lora_name}}"
@@ -107,7 +110,37 @@ sample:
 
 ---
 
-## 5. Standalone Smoke Test (Before Training)
+## 5. Startup Preflight Checks
+
+When `sample.remote_comfyui.enabled: true` and `preflight_check` is `"strict"` (default) or `"warn"`, `ai-toolkit` runs fast (< 1s, no GPU render) startup checks before training begins:
+
+1. **`samples_non_empty`** — Verifies `sample.samples` has at least 1 prompt (catches YAML indentation errors immediately).
+2. **`node_overrides`** — Verifies every node ID in `node_overrides` exists in `workflow_path`.
+3. **`ws_output_node`** — Verifies at least one `SaveImageWebsocket` (or `SaveImage` / `PreviewImage` when `replace_save_with_websocket: true`) node exists.
+4. **`lora_placeholder`** — Warns if `{{lora_name}}` does not appear anywhere in the workflow/overrides.
+5. **`lora_path_mapping`** — Verifies `save_root` sits under `local_root` and logs the resolved remote `lora_name` pattern.
+6. **`server_reachable`** — Calls `GET {server_url}/system_stats` and logs Machine B's ComfyUI version & GPUs.
+7. **`websocket_handshake`** — Opens and closes `/ws?clientId=...` to verify WebSocket upgrade works.
+8. **`workflow_nodes` & `workflow_models`** — Calls `GET {server_url}/object_info/{class_type}` for `SaveImageWebsocket` and every node in the workflow, verifying no missing nodes and that static model/combo inputs (`unet_name`, `clip_name`, `vae_name`, `sampler_name`, etc.) exist on Machine B.
+9. **`sshfs_mount_probe`** (when `preflight_sshfs_probe: true`) — Writes a 0-byte sentinel `_aitk_remote_probe_<id>.safetensors` in `save_root`, checks `GET {server_url}/object_info/LoraLoaderModelOnly` for the mapped `lora_name`, and deletes the sentinel file immediately. This verifies `sshfs`, `-o cache=no`, and `remote_lora_prefix` end-to-end.
+
+---
+
+## 6. Standalone Smoke Test & Preflight CLI (Before Training)
+
+Run startup preflight checks only (< 1s, no render):
+
+```bash
+python3 /home/yzhang/Desktop/ai-toolkit/toolkit/remote_comfyui_sampler.py \
+  --preflight \
+  --server http://pc-b:8188 \
+  --workflow ./docs/workflows/lora_tester_qi21_api.json \
+  --local-root /home/yzhang/ai-toolkit/output \
+  --save-root /home/yzhang/ai-toolkit/output/qi21_lora_test \
+  --prefix pc-a
+```
+
+Run a full 1-image WebSocket streaming test:
 
 You can test Machine A → Machine B streaming directly from the CLI:
 
