@@ -598,6 +598,58 @@ class TestRemoteComfyUISampler(unittest.TestCase):
             finally:
                 server.close()
 
+    def test_workflow_tool_convert_plain_and_turbo_workflows(self):
+        import importlib.util
+
+        tool_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "scripts",
+            "comfyui_workflow_tool.py",
+        )
+        spec = importlib.util.spec_from_file_location("comfyui_workflow_tool", tool_path)
+        tool = importlib.util.module_from_spec(spec)
+        assert spec is not None and spec.loader is not None
+        spec.loader.exec_module(tool)
+
+        # Case 1: 4-step workflow with NO LoRA node (UNETLoader "5" -> QwenImage21Cache "16")
+        wf_no_lora = {
+            "3": {"class_type": "TextEncodeQwenImage21", "inputs": {"prompt": "hi", "negative_prompt": ""}, "_meta": {"title": "Text Encode"}},
+            "5": {"class_type": "UNETLoader", "inputs": {"unet_name": "qi21_wuli4steps.safetensors"}},
+            "16": {"class_type": "QwenImage21Cache", "inputs": {"model": ["5", 0], "device": "auto", "dtype": "default"}},
+            "9": {"class_type": "PreviewImage", "inputs": {"images": ["2", 0]}},
+        }
+        conv1, _ = tool.convert_workflow(wf_no_lora)
+        # Original input untouched
+        self.assertEqual(wf_no_lora["16"]["inputs"]["model"], ["5", 0])
+        # New AITK_LORA node "17" spliced between "5" -> "16"
+        self.assertIn("17", conv1)
+        self.assertEqual(conv1["17"]["class_type"], "LoraLoaderModelOnly")
+        self.assertEqual(conv1["17"]["_meta"]["title"], "AITK_LORA")
+        self.assertEqual(conv1["17"]["inputs"]["model"], ["5", 0])
+        self.assertEqual(conv1["16"]["inputs"]["model"], ["17", 0])
+        self.assertEqual(conv1["3"]["_meta"]["title"], "AITK_PROMPT")
+        self.assertEqual(conv1["9"]["class_type"], "SaveImageWebsocket")
+
+        # Case 2: 8-step workflow WITH existing Turbo LoRA on "11" -> auto-stacks AITK_LORA AFTER "11"
+        wf_turbo = {
+            "3": {"class_type": "TextEncodeQwenImage21", "inputs": {"prompt": "hi"}, "_meta": {"title": "Text Encode"}},
+            "5": {"class_type": "UNETLoader", "inputs": {"unet_name": "base.safetensors"}},
+            "11": {
+                "class_type": "LoraLoaderModelOnly",
+                "inputs": {"lora_name": "qi21/qwen_image_2.1_turbo_lora.safetensors", "strength_model": 1, "model": ["5", 0]},
+                "_meta": {"title": "Load LoRA"},
+            },
+            "4": {"class_type": "QwenImage21Cache", "inputs": {"model": ["11", 0]}},
+            "9": {"class_type": "PreviewImage", "inputs": {"images": ["2", 0]}},
+        }
+        conv2, _ = tool.convert_workflow(wf_turbo)
+        # Turbo LoRA "11" preserved untouched; new AITK_LORA "12" inserted between "11" -> "4"
+        self.assertEqual(conv2["11"]["_meta"]["title"], "Load LoRA")
+        self.assertEqual(conv2["11"]["inputs"]["lora_name"], "qi21/qwen_image_2.1_turbo_lora.safetensors")
+        self.assertEqual(conv2["12"]["_meta"]["title"], "AITK_LORA")
+        self.assertEqual(conv2["12"]["inputs"]["model"], ["11", 0])
+        self.assertEqual(conv2["4"]["inputs"]["model"], ["12", 0])
+
     def test_metadata_binary_event(self):
         server = _MockComfyServer(fail_first_n_not_in_list=0, use_metadata_event=True)
         try:

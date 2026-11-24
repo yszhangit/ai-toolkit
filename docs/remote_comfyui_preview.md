@@ -105,9 +105,25 @@ When `sample.remote_comfyui.enabled: true` and `preflight_check` is `"strict"` (
 
 ---
 
-## 6. Standalone Preflight & Smoke Test CLI
+## 6. Workflow Validate / Convert Utility & Smoke Test CLI
 
-Run startup preflight checks only (< 1s, no GPU render):
+If you export a raw ComfyUI API workflow without renaming nodes or with the training LoRA node omitted/disabled, use `scripts/comfyui_workflow_tool.py` to **validate** or **convert** it into a new file (the original file is never modified):
+
+```bash
+# 1. Inspect & validate any workflow (add --server http://pc-b:8188 to also check Machine B nodes & models):
+python3 scripts/comfyui_workflow_tool.py validate user_upload/lora_tester_qi21_4steps.json \
+  --server http://pc-b:8188
+
+# 2. Convert a raw API workflow -> renames prompt to AITK_PROMPT, inserts/renames AITK_LORA,
+#    rewrites PreviewImage/SaveImage -> SaveImageWebsocket, and validates against Machine B:
+python3 scripts/comfyui_workflow_tool.py convert user_upload/lora_tester_qi21_4steps.json \
+  -o work/lora_tester_qi21_4steps_aitk.json \
+  --server http://pc-b:8188
+```
+
+- If the workflow already contains a **Turbo / Lightning / LCM LoRA** (like `lora_tester_qi21_8steps.json`), `convert` automatically keeps the Turbo LoRA untouched and stacks a new `AITK_LORA` node right after it (or pass `--insert-lora` explicitly).
+
+Run startup preflight checks directly via the sampler CLI (< 1s, no GPU render):
 
 ```bash
 python3 /home/yzhang/Desktop/ai-toolkit/toolkit/remote_comfyui_sampler.py \
