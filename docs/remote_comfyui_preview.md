@@ -36,26 +36,18 @@ sshfs -o cache=no,reconnect,ServerAliveInterval=15,ServerAliveCountMax=3 \
 
 ---
 
-## 3. Exporting Your Workflow from Machine B
+## 3. Exporting Your Workflow from Machine B (Zero Manual JSON Editing)
 
-1. Build and test your workflow on Machine B with a normal `SaveImage` (or `PreviewImage`) node and one LoRA loader (`LoraLoader` / `LoraLoaderModelOnly`).
-2. In ComfyUI, export **API format**: **Workflow → Export (API)** (not regular Save, which saves the UI graph format).
-3. Copy `workflow.json` to Machine A and either:
-   - **Option A (Placeholders directly in `workflow.json`):** Replace the dynamic fields with `{{lora_name}}`, `{{lora_strength}}`, `{{prompt}}`, `{{negative_prompt}}`, `{{seed}}`, `{{steps}}`, `{{cfg}}`, `{{width}}`, `{{height}}`, OR
-   - **Option B (Keep `workflow.json` untouched):** Map node IDs in your YAML under `node_overrides` (example below).
+1. Build and test any workflow in ComfyUI on Machine B (standard, 8-step Turbo LoRA + training LoRA, MiniMax H3 Image, etc.) with your own `steps`, `cfg`, `seed`, `width`, `height`, `negative_prompt`, and `strength_model` — **all sampler parameters stay your responsibility in the workflow**.
+2. In ComfyUI's UI, right-click and **rename the Title** of just 2 nodes:
+   - Your training LoRA loader node (`LoraLoaderModelOnly` / `LoraLoader`) → **`AITK_LORA`**
+     *(Any other LoRA nodes, such as a fixed Turbo LoRA, keep their normal title and are left untouched.)*
+   - Your prompt / text-encode node (`TextEncodeQwenImage21`, `CLIPTextEncode`, etc.) → **`AITK_PROMPT`**
+     *(Replaces `prompt` or `text` with each prompt from `sample.samples`; leaves `negative_prompt` untouched unless you optionally title a node `AITK_NEG_PROMPT`.)*
+3. Leave your normal `SaveImage` or `PreviewImage` node as-is (`replace_save_with_websocket: true` automatically converts it to `SaveImageWebsocket` on submission).
+4. Export **API format**: **Workflow → Export (API)** (not regular Save), copy the `.json` to Machine A, and point `workflow_path` at it — **no manual JSON editing required**.
 
-Supported placeholders (exact matches preserve `int` / `float` JSON types):
-- `{{lora_name}}` (str) — relative path under Machine B's `models/loras/`
-- `{{lora_strength}}` (float)
-- `{{prompt}}` (str)
-- `{{negative_prompt}}` (str)
-- `{{seed}}` (int)
-- `{{steps}}` (int)
-- `{{cfg}}` (float)
-- `{{width}}` (int)
-- `{{height}}` (int)
-- `{{step}}` (int)
-- `{{job_name}}` (str)
+*(Optional advanced fallback: `{{lora_name}}`, `{{lora_strength}}`, `{{prompt}}`, `{{negative_prompt}}`, `{{seed}}`, `{{steps}}`, `{{cfg}}`, `{{width}}`, `{{height}}` placeholders and `node_overrides` are still supported if you ever want YAML-driven overrides.)*
 
 ---
 
@@ -92,6 +84,9 @@ sample:
     request_timeout: 600
     lora_wait_retries: 6
     lora_wait_interval: 5.0
+    lora_node_title: "AITK_LORA"       # ComfyUI node title whose lora_name gets replaced with each checkpoint
+    prompt_node_title: "AITK_PROMPT"   # ComfyUI node title whose prompt/text gets replaced per sample prompt
+    neg_prompt_node_title: "AITK_NEG_PROMPT"  # optional; leave unused to keep workflow's own negative prompt
     preflight_check: "strict"          # "strict" (fail fast on startup), "warn" (log & continue), or "off"
     preflight_timeout: 10.0            # seconds per HTTP/WS startup check
     preflight_sshfs_probe: true        # write+delete 0-byte sentinel .safetensors to verify sshfs & prefix

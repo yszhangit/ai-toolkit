@@ -21,8 +21,10 @@ try:
         RemoteComfyUIError,
         RemoteComfyUISampler,
         apply_node_overrides,
+        bind_titled_nodes,
         execute_comfyui_workflow_ws,
         extract_ws_image_bytes,
+        find_titled_node_bindings,
         render_workflow_template,
         resolve_remote_lora_name,
         rewrite_save_nodes_to_websocket,
@@ -43,8 +45,10 @@ except ImportError:
     RemoteComfyUIError = _mod.RemoteComfyUIError
     RemoteComfyUISampler = _mod.RemoteComfyUISampler
     apply_node_overrides = _mod.apply_node_overrides
+    bind_titled_nodes = _mod.bind_titled_nodes
     execute_comfyui_workflow_ws = _mod.execute_comfyui_workflow_ws
     extract_ws_image_bytes = _mod.extract_ws_image_bytes
+    find_titled_node_bindings = _mod.find_titled_node_bindings
     render_workflow_template = _mod.render_workflow_template
     resolve_remote_lora_name = _mod.resolve_remote_lora_name
     rewrite_save_nodes_to_websocket = _mod.rewrite_save_nodes_to_websocket
@@ -577,6 +581,84 @@ class TestRemoteComfyUISampler(unittest.TestCase):
                     self.assertIsNone(sampler_off.preflight_report)
                 finally:
                     sampler_off.stop()
+            finally:
+                server.close()
+
+    def test_titled_node_binding_preserves_user_workflow_params(self):
+        # Raw ComfyUI API export with TWO LoRAs (Turbo + training LoRA titled AITK_LORA) and AITK_PROMPT
+        raw_wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 42, "steps": 8, "cfg": 1}},
+            "3": {
+                "class_type": "TextEncodeQwenImage21",
+                "inputs": {"prompt": "old prompt", "negative_prompt": "keep my neg", "resolution": 1024},
+                "_meta": {"title": "AITK_PROMPT"},
+            },
+            "11": {
+                "class_type": "LoraLoaderModelOnly",
+                "inputs": {"lora_name": "qi21/turbo.safetensors", "strength_model": 1.0, "model": ["5", 0]},
+                "_meta": {"title": "Load Turbo LoRA"},
+            },
+            "10": {
+                "class_type": "LoraLoaderModelOnly",
+                "inputs": {"lora_name": "some_dummy_lora_not_on_disk.safetensors", "strength_model": 0.75, "model": ["11", 0]},
+                "_meta": {"title": "AITK_LORA"},
+            },
+            "9": {"class_type": "PreviewImage", "inputs": {"images": ["2", 0]}},
+        }
+        bound, bindings = bind_titled_nodes(
+            raw_wf,
+            lora_name="pc-a/my_job/my_job_000000250.safetensors",
+            prompt="tester42, portrait",
+            negative_prompt="ignored because no AITK_NEG_PROMPT",
+        )
+        self.assertEqual(bindings["lora"], [("10", "lora_name")])
+        self.assertEqual(bindings["prompt"], [("3", "prompt")])
+        # Training LoRA & prompt replaced:
+        self.assertEqual(bound["10"]["inputs"]["lora_name"], "pc-a/my_job/my_job_000000250.safetensors")
+        self.assertEqual(bound["3"]["inputs"]["prompt"], "tester42, portrait")
+        # All user-chosen workflow params stay 100% untouched:
+        self.assertEqual(bound["11"]["inputs"]["lora_name"], "qi21/turbo.safetensors")
+        self.assertEqual(bound["10"]["inputs"]["strength_model"], 0.75)
+        self.assertEqual(bound["3"]["inputs"]["negative_prompt"], "keep my neg")
+        self.assertEqual(bound["1"]["inputs"]["steps"], 8)
+        self.assertEqual(bound["1"]["inputs"]["cfg"], 1)
+
+        # Preflight must skip validating placeholder lora_name on AITK_LORA while STILL validating Turbo LoRA on "11"
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = os.path.join(tmp, "output")
+            job_dir = os.path.join(output_root, "my_job")
+            os.makedirs(job_dir, exist_ok=True)
+            turbo_file = os.path.join(output_root, "turbo.safetensors")
+            with open(turbo_file, "wb") as f:
+                f.write(b"x")
+            raw_wf["11"]["inputs"]["lora_name"] = "pc-a/turbo.safetensors"
+            wf_path = os.path.join(tmp, "raw_8steps.json")
+            with open(wf_path, "w", encoding="utf-8") as f:
+                json.dump(raw_wf, f)
+
+            server = _MockComfyServer(loras_root=output_root, loras_prefix="pc-a")
+            try:
+                cfg = RemoteComfyUIConfig(
+                    enabled=True,
+                    server_url=server.url,
+                    workflow_path=wf_path,
+                    remote_lora_prefix="pc-a",
+                    preflight_check="strict",
+                    preflight_sshfs_probe=True,
+                )
+                sampler = RemoteComfyUISampler(
+                    cfg,
+                    training_folder=output_root,
+                    job_name="my_job",
+                    log_fn=lambda _: None,
+                    save_root=job_dir,
+                    sample_prompts_count=1,
+                )
+                try:
+                    self.assertTrue(sampler.preflight_report["ok"])
+                    self.assertEqual(sampler.preflight_report["warnings"], [])
+                finally:
+                    sampler.stop()
             finally:
                 server.close()
 

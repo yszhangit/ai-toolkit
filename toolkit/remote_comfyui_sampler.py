@@ -53,6 +53,10 @@ class RemoteComfyUIConfig:
         self.path_separator: str = kwargs.get('path_separator', '/')
         # Automatically convert SaveImage / PreviewImage nodes to SaveImageWebsocket so 0 files hit Machine B's disk
         self.replace_save_with_websocket: bool = kwargs.get('replace_save_with_websocket', True)
+        # Node titles (_meta.title) renamed in ComfyUI UI so raw API-exported JSON needs zero manual editing
+        self.lora_node_title: str = str(kwargs.get('lora_node_title', 'AITK_LORA') or '')
+        self.prompt_node_title: str = str(kwargs.get('prompt_node_title', 'AITK_PROMPT') or '')
+        self.neg_prompt_node_title: str = str(kwargs.get('neg_prompt_node_title', 'AITK_NEG_PROMPT') or '')
         # Optional overrides applied to workflow JSON before placeholder substitution:
         #   {"10.inputs.lora_name": "{{lora_name}}", "6.inputs.text": "{{prompt}}"}
         self.node_overrides: dict = kwargs.get('node_overrides', {}) or {}
@@ -311,6 +315,94 @@ def resolve_remote_lora_name(
     parts.extend(p for p in rel.replace("\\", "/").split("/") if p and p != ".")
     sep = path_separator or "/"
     return sep.join(parts)
+
+
+_LORA_FIELD_CANDIDATES = ("lora_name", "lora")
+_PROMPT_FIELD_CANDIDATES = ("prompt", "text", "string", "value", "positive")
+_NEG_PROMPT_FIELD_CANDIDATES = ("negative_prompt", "text", "prompt", "string", "value", "negative")
+
+
+def _node_title(node: Any) -> str:
+    if not isinstance(node, dict):
+        return ""
+    meta = node.get("_meta")
+    if isinstance(meta, dict):
+        return str(meta.get("title") or "").strip()
+    return ""
+
+
+def _pick_input_field(inputs: Dict[str, Any], candidates: Tuple[str, ...]) -> Optional[str]:
+    for field in candidates:
+        if field in inputs and not isinstance(inputs[field], list):
+            return field
+    return None
+
+
+def find_titled_node_bindings(
+    workflow: Dict[str, Any],
+    lora_node_title: str = "AITK_LORA",
+    prompt_node_title: str = "AITK_PROMPT",
+    neg_prompt_node_title: str = "AITK_NEG_PROMPT",
+) -> Dict[str, List[Tuple[str, str]]]:
+    """Find nodes renamed in ComfyUI UI (_meta.title) for ai-toolkit binding.
+
+    Returns {"lora": [(node_id, field), ...], "prompt": [...], "neg_prompt": [...]}.
+    Matching is case-insensitive on stripped _meta.title.
+    """
+    targets = {
+        "lora": (lora_node_title.strip().lower(), _LORA_FIELD_CANDIDATES),
+        "prompt": (prompt_node_title.strip().lower(), _PROMPT_FIELD_CANDIDATES),
+        "neg_prompt": (neg_prompt_node_title.strip().lower(), _NEG_PROMPT_FIELD_CANDIDATES),
+    }
+    found: Dict[str, List[Tuple[str, str]]] = {"lora": [], "prompt": [], "neg_prompt": []}
+    for nid, node in workflow.items():
+        if not isinstance(node, dict):
+            continue
+        title = _node_title(node).lower()
+        if not title:
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        for role, (wanted, candidates) in targets.items():
+            if wanted and title == wanted:
+                field = _pick_input_field(inputs, candidates)
+                if field is not None:
+                    found[role].append((str(nid), field))
+    return found
+
+
+def bind_titled_nodes(
+    workflow: Dict[str, Any],
+    lora_name: Optional[str] = None,
+    prompt: Optional[str] = None,
+    negative_prompt: Optional[str] = None,
+    lora_node_title: str = "AITK_LORA",
+    prompt_node_title: str = "AITK_PROMPT",
+    neg_prompt_node_title: str = "AITK_NEG_PROMPT",
+) -> Tuple[Dict[str, Any], Dict[str, List[Tuple[str, str]]]]:
+    """Inject lora_name / prompt / negative_prompt into nodes renamed in ComfyUI UI.
+
+    Leaves all other sampler params (steps, cfg, seed, width, height, strength, etc.)
+    untouched — those stay the user's responsibility in their ComfyUI workflow.
+    """
+    wf = copy.deepcopy(workflow)
+    bindings = find_titled_node_bindings(
+        wf,
+        lora_node_title=lora_node_title,
+        prompt_node_title=prompt_node_title,
+        neg_prompt_node_title=neg_prompt_node_title,
+    )
+    if lora_name is not None:
+        for nid, field in bindings["lora"]:
+            wf[nid]["inputs"][field] = lora_name
+    if prompt is not None:
+        for nid, field in bindings["prompt"]:
+            wf[nid]["inputs"][field] = prompt
+    if negative_prompt is not None and negative_prompt != "":
+        for nid, field in bindings["neg_prompt"]:
+            wf[nid]["inputs"][field] = negative_prompt
+    return wf, bindings
 
 
 def apply_node_overrides(workflow: Dict[str, Any], overrides: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -638,15 +730,41 @@ class RemoteComfyUISampler:
                     "workflow has no SaveImageWebsocket (nor SaveImage/PreviewImage to rewrite)",
                 )
 
-        # 4. {{lora_name}} binding
+        # 4. LoRA & Prompt bindings (either renamed ComfyUI node titles OR {{...}} placeholders)
+        bindings: Dict[str, List[Tuple[str, str]]] = {"lora": [], "prompt": [], "neg_prompt": []}
         if ws_wf is not None:
-            if _workflow_contains_placeholder(ws_wf, "{{lora_name}}"):
-                record("lora_placeholder", "PASS", "{{lora_name}} found in workflow")
+            bindings = find_titled_node_bindings(
+                ws_wf,
+                lora_node_title=self.config.lora_node_title,
+                prompt_node_title=self.config.prompt_node_title,
+                neg_prompt_node_title=self.config.neg_prompt_node_title,
+            )
+            has_lora_placeholder = _workflow_contains_placeholder(ws_wf, "{{lora_name}}")
+            if bindings["lora"]:
+                desc = ", ".join(f"node {nid}.{fld}" for nid, fld in bindings["lora"])
+                record("lora_binding", "PASS", f"title {self.config.lora_node_title!r} -> {desc}")
+            elif has_lora_placeholder:
+                record("lora_binding", "PASS", "{{lora_name}} placeholder found in workflow")
             else:
                 record(
-                    "lora_placeholder",
+                    "lora_binding",
                     "WARN",
-                    "{{lora_name}} not found in workflow or node_overrides; checkpoints will not be substituted",
+                    f"no node titled {self.config.lora_node_title!r} and no {{{{lora_name}}}} placeholder found; "
+                    "saved checkpoints will not be substituted",
+                )
+
+            has_prompt_placeholder = _workflow_contains_placeholder(ws_wf, "{{prompt}}")
+            if bindings["prompt"]:
+                desc = ", ".join(f"node {nid}.{fld}" for nid, fld in bindings["prompt"])
+                record("prompt_binding", "PASS", f"title {self.config.prompt_node_title!r} -> {desc}")
+            elif has_prompt_placeholder:
+                record("prompt_binding", "PASS", "{{prompt}} placeholder found in workflow")
+            else:
+                record(
+                    "prompt_binding",
+                    "WARN",
+                    f"no node titled {self.config.prompt_node_title!r} and no {{{{prompt}}}} placeholder found; "
+                    "workflow's hardcoded prompt will be used as-is",
                 )
 
         # 5. Local-to-remote LoRA path mapping
@@ -725,7 +843,13 @@ class RemoteComfyUISampler:
             else:
                 record("workflow_nodes", "PASS", f"all {len(class_types)} node class(es) available on Machine B")
 
-            # Validate static combo inputs (e.g. unet_name, clip_name, vae_name, sampler_name)
+            # Validate static combo inputs (e.g. unet_name, clip_name, vae_name, turbo lora_name, sampler_name)
+            # Skip fields bound to dynamic AITK_LORA / AITK_PROMPT / AITK_NEG_PROMPT targets.
+            dynamic_fields = {
+                (nid, fld)
+                for role in ("lora", "prompt", "neg_prompt")
+                for nid, fld in bindings[role]
+            }
             for nid, node in ws_wf.items():
                 if not isinstance(node, dict):
                     continue
@@ -740,6 +864,8 @@ class RemoteComfyUISampler:
                     if isinstance(sec, dict):
                         all_specs.update(sec)
                 for field, val in (node.get("inputs") or {}).items():
+                    if (str(nid), field) in dynamic_fields:
+                        continue
                     if not isinstance(val, str) or "{{" in val:
                         continue
                     options = _extract_combo_options(all_specs.get(field))
@@ -975,7 +1101,16 @@ class RemoteComfyUISampler:
                 "step": int(step),
                 "job_name": self.job_name,
             }
-            rendered_wf = render_workflow_template(ws_wf, variables)
+            bound_wf, _ = bind_titled_nodes(
+                ws_wf,
+                lora_name=lora_name,
+                prompt=gen_cfg.prompt or "",
+                negative_prompt=gen_cfg.negative_prompt or "",
+                lora_node_title=self.config.lora_node_title,
+                prompt_node_title=self.config.prompt_node_title,
+                neg_prompt_node_title=self.config.neg_prompt_node_title,
+            )
+            rendered_wf = render_workflow_template(bound_wf, variables)
             try:
                 raw_images = execute_comfyui_workflow_ws(
                     server_url=self.config.server_url,
@@ -1061,8 +1196,14 @@ def _cli() -> None:
     with open(args.workflow, "r", encoding="utf-8") as f:
         wf = json.load(f)
     ws_wf, ws_nodes = rewrite_save_nodes_to_websocket(wf, replace_save=True)
-    rendered = render_workflow_template(
+    bound_wf, _ = bind_titled_nodes(
         ws_wf,
+        lora_name=args.lora,
+        prompt=args.prompt,
+        negative_prompt=args.neg,
+    )
+    rendered = render_workflow_template(
+        bound_wf,
         {
             "prompt": args.prompt,
             "negative_prompt": args.neg,
