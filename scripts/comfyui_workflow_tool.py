@@ -356,7 +356,6 @@ def inspect_and_validate(
     local_root: Optional[str] = None,
     save_root: Optional[str] = None,
     prefix: str = "",
-    sshfs_probe: bool = False,
 ) -> bool:
     mod = _load_sampler_module()
     wf = _load_api_workflow(workflow_path)
@@ -385,7 +384,6 @@ def inspect_and_validate(
             lora_node_title=lora_title,
             prompt_node_title=prompt_title,
             preflight_check="warn",
-            preflight_sshfs_probe=sshfs_probe,
         )
         sampler = mod.RemoteComfyUISampler(
             config=cfg,
@@ -431,10 +429,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_val.add_argument("--lora-title", default="AITK_LORA")
     p_val.add_argument("--prompt-title", default="AITK_PROMPT")
     p_val.add_argument("--server", default=None, help="Optional Machine B ComfyUI URL for live preflight")
-    p_val.add_argument("--local-root", default=None, help="Local output root on Machine A (for sshfs probe)")
-    p_val.add_argument("--save-root", default=None, help="Job save_root on Machine A (for sshfs probe)")
+    p_val.add_argument("--local-root", default=None, help="Local output root on Machine A")
+    p_val.add_argument("--save-root", default=None, help="Job save_root on Machine A")
     p_val.add_argument("--prefix", default="", help="remote_lora_prefix on Machine B")
-    p_val.add_argument("--sshfs-probe", action="store_true", help="Enable live sentinel .safetensors probe")
 
     p_conv = sub.add_parser("convert", help="Convert a raw ComfyUI API workflow JSON for ai-toolkit")
     p_conv.add_argument("input", help="Path to raw ComfyUI API workflow JSON (never modified unless same as -o)")
@@ -451,7 +448,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_conv.add_argument("--local-root", default=None)
     p_conv.add_argument("--save-root", default=None)
     p_conv.add_argument("--prefix", default="")
-    p_conv.add_argument("--sshfs-probe", action="store_true")
 
     args = parser.parse_args(argv)
 
@@ -464,7 +460,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             local_root=args.local_root,
             save_root=args.save_root,
             prefix=args.prefix,
-            sshfs_probe=args.sshfs_probe,
         )
         return 0 if ok else 1
 
@@ -498,7 +493,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             local_root=args.local_root,
             save_root=args.save_root,
             prefix=args.prefix,
-            sshfs_probe=args.sshfs_probe,
         )
         return 0 if ok else 1
 

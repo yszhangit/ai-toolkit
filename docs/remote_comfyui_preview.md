@@ -84,24 +84,22 @@ Add `remote_comfyui:` inside `sample:` in your job YAML:
         lora_wait_interval: 5.0
         preflight_check: "strict"          # "strict" (fail fast), "warn" (log & continue), or "off"
         preflight_timeout: 10.0
-        preflight_sshfs_probe: true        # write+delete 0-byte sentinel .safetensors to verify sshfs & prefix
 ```
 
 ---
 
 ## 5. Startup Preflight Checks
 
-When `sample.remote_comfyui.enabled: true` and `preflight_check` is `"strict"` (default) or `"warn"`, `ai-toolkit` validates the **2 inputs, 1 output, Machine B, and sshfs mount** in < 1s before training starts:
+When `sample.remote_comfyui.enabled: true` and `preflight_check` is `"strict"` (default) or `"warn"`, `ai-toolkit` validates the **2 inputs, 1 output, and Machine B ComfyUI** in < 1s before training starts:
 
 1. **`samples_non_empty`** — Verifies `sample.samples` has at least 1 prompt.
 2. **`lora_input_node`** — Verifies a node titled `AITK_LORA` with a `lora_name` input exists.
 3. **`prompt_input_node`** — Verifies a node titled `AITK_PROMPT` with a `prompt`/`text` input exists.
 4. **`ws_output_node`** — Verifies a `SaveImageWebsocket` (or rewritable `SaveImage`/`PreviewImage`) output node exists.
 5. **`lora_path_mapping`** — Verifies `save_root` sits under `local_root` and logs the mapped `lora_name` pattern.
-6. **`server_reachable`** — Calls `GET {server_url}/system_stats`.
+6. **`server_reachable`** — Calls `GET {server_url}/system_stats` (verifies Machine B ComfyUI port is up).
 7. **`websocket_handshake`** — Opens and closes `/ws?clientId=...`.
 8. **`workflow_nodes` & `workflow_models`** — Verifies all workflow node classes and static model/combo inputs (`unet_name`, `clip_name`, `vae_name`, fixed Turbo LoRA, etc.) exist on Machine B (skipping the placeholder `lora_name` on `AITK_LORA`).
-9. **`sshfs_mount_probe`** — Writes a 0-byte `_aitk_remote_probe_<id>.safetensors` in `save_root`, confirms Machine B sees the mapped `lora_name`, and deletes it immediately.
 
 ---
 

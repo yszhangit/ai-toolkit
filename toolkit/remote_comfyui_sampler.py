@@ -74,8 +74,6 @@ class RemoteComfyUIConfig:
         # Startup preflight verification: "strict" (fail fast), "warn" (log and continue), or "off"
         self.preflight_check: str = str(kwargs.get('preflight_check', 'strict')).strip().lower()
         self.preflight_timeout: float = float(kwargs.get('preflight_timeout', 10.0))
-        # Write+delete a 0-byte sentinel .safetensors in save_root to prove sshfs + remote_lora_prefix work
-        self.preflight_sshfs_probe: bool = bool(kwargs.get('preflight_sshfs_probe', True))
 
 
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -604,7 +602,7 @@ class RemoteComfyUISampler:
         )
 
     def run_preflight(self, strict: bool = False) -> Dict[str, Any]:
-        """Validate the 2 input nodes (LoRA, Prompt), 1 output node (WS), Machine B, and sshfs mount."""
+        """Validate the 2 input nodes (LoRA, Prompt), 1 output node (WS), and Machine B ComfyUI."""
         checks: List[Tuple[str, str, str]] = []  # (name, status, detail)
         errors: List[str] = []
         warnings: List[str] = []
@@ -777,79 +775,6 @@ class RemoteComfyUISampler:
                 )
             elif not missing_classes:
                 record("workflow_models", "PASS", "all static model/combo inputs verified on Machine B")
-
-        # 7. End-to-end sshfs + remote_lora_prefix sentinel probe
-        if server_ok and self.config.preflight_sshfs_probe and sample_remote_lora is not None:
-            lora_cls = None
-            for candidate in ("LoraLoaderModelOnly", "LoraLoader"):
-                if candidate in fetched_object_info:
-                    lora_cls = candidate
-                    break
-            if lora_cls is None:
-                for candidate in ("LoraLoaderModelOnly", "LoraLoader"):
-                    try:
-                        r = requests.get(f"{base_url}/object_info/{candidate}", timeout=timeout)
-                        if r.status_code == 200 and candidate in r.json():
-                            lora_cls = candidate
-                            break
-                    except Exception:
-                        pass
-
-            if lora_cls is None:
-                record("sshfs_mount_probe", "WARN", "no LoraLoader node found on Machine B to verify sshfs mount")
-            else:
-                probe_name = f"_aitk_remote_probe_{uuid.uuid4().hex[:8]}.safetensors"
-                probe_path = os.path.join(self.save_root, probe_name)
-                expected_remote = resolve_remote_lora_name(
-                    probe_path,
-                    self.local_root,
-                    remote_lora_prefix=self.config.remote_lora_prefix,
-                    path_separator=self.config.path_separator,
-                )
-                try:
-                    os.makedirs(self.save_root, exist_ok=True)
-                    with open(probe_path, "wb"):
-                        pass
-                    found = False
-                    available: List[str] = []
-                    for attempt in range(2):
-                        r = requests.get(f"{base_url}/object_info/{lora_cls}", timeout=timeout)
-                        if r.status_code == 200:
-                            cls_data = r.json().get(lora_cls, {})
-                            req_specs = (cls_data.get("input") or {}).get("required") or {}
-                            opts = _extract_combo_options(req_specs.get("lora_name")) or []
-                            available = [str(x) for x in opts]
-                            if expected_remote in available:
-                                found = True
-                                break
-                        if attempt == 0:
-                            time.sleep(0.5)
-                    if found:
-                        record("sshfs_mount_probe", "PASS", f"Machine B saw sentinel {expected_remote!r}")
-                    else:
-                        prefix_norm = (self.config.remote_lora_prefix or "").strip().strip("/\\")
-                        same_prefix = [
-                            x for x in available if prefix_norm and x.replace("\\", "/").startswith(prefix_norm + "/")
-                        ]
-                        hint = (
-                            f"found {len(same_prefix)} LoRA(s) under prefix {prefix_norm!r} "
-                            f"(e.g. {same_prefix[:2]}) — check sshfs cache (-o cache=no) or remote_lora_prefix/local_root"
-                            if same_prefix
-                            else f"0 LoRAs found under prefix {prefix_norm!r} — check sshfs mount on Machine B and remote_lora_prefix"
-                        )
-                        record(
-                            "sshfs_mount_probe",
-                            "FAIL",
-                            f"Machine B did not see sentinel {expected_remote!r} ({hint})",
-                        )
-                except Exception as e:
-                    record("sshfs_mount_probe", "FAIL", f"sentinel probe failed: {e}")
-                finally:
-                    try:
-                        if os.path.exists(probe_path):
-                            os.remove(probe_path)
-                    except OSError:
-                        pass
 
         self.log_fn(f"[RemoteComfyUI] Startup preflight ({base_url}):")
         for name, status, detail in checks:
@@ -1032,10 +957,9 @@ def _cli() -> None:
     parser.add_argument("--lora-title", default="AITK_LORA", help="ComfyUI node title for training LoRA")
     parser.add_argument("--prompt-title", default="AITK_PROMPT", help="ComfyUI node title for prompt")
     parser.add_argument("--preflight", action="store_true", help="Run startup preflight checks only (no image render)")
-    parser.add_argument("--local-root", default=None, help="Local output root on Machine A for --preflight sshfs probe")
-    parser.add_argument("--save-root", default=None, help="Job save_root on Machine A for --preflight sshfs probe")
-    parser.add_argument("--prefix", default="", help="remote_lora_prefix for --preflight sshfs probe")
-    parser.add_argument("--no-sshfs-probe", action="store_true", help="Skip sentinel .safetensors check during --preflight")
+    parser.add_argument("--local-root", default=None, help="Local output root on Machine A for --preflight path mapping")
+    parser.add_argument("--save-root", default=None, help="Job save_root on Machine A for --preflight path mapping")
+    parser.add_argument("--prefix", default="", help="remote_lora_prefix for --preflight path mapping")
     parser.add_argument("--output", default="./remote_comfyui_test.png", help="Output path on Machine A")
     args = parser.parse_args()
 
@@ -1051,7 +975,6 @@ def _cli() -> None:
             lora_node_title=args.lora_title,
             prompt_node_title=args.prompt_title,
             preflight_check="strict",
-            preflight_sshfs_probe=not args.no_sshfs_probe,
         )
         sampler = RemoteComfyUISampler(
             config=cfg,

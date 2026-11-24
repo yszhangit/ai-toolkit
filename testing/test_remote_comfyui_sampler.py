@@ -467,7 +467,6 @@ class TestRemoteComfyUISampler(unittest.TestCase):
                     lora_wait_interval=0.05,
                     request_timeout=10.0,
                     preflight_check="strict",
-                    preflight_sshfs_probe=True,
                 )
                 sampler = RemoteComfyUISampler(
                     cfg,
@@ -479,7 +478,6 @@ class TestRemoteComfyUISampler(unittest.TestCase):
                 )
                 try:
                     self.assertTrue(sampler.preflight_report["ok"])
-                    self.assertEqual([fn for fn in os.listdir(job_dir) if "_aitk_remote_probe_" in fn], [])
                     c0 = _DummyGenConfig(samples_dir, 200, "short")
                     c1 = _DummyGenConfig(samples_dir, 200, "longer prompt text")
                     sampler.enqueue(200, lora_file, [c0, c1])
@@ -505,7 +503,7 @@ class TestRemoteComfyUISampler(unittest.TestCase):
             finally:
                 server.close()
 
-    def test_preflight_requires_2_inputs_1_output_models_and_sshfs(self):
+    def test_preflight_requires_2_inputs_1_output_and_models(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_root = os.path.join(tmp, "output")
             job_dir = os.path.join(output_root, "my_job")
@@ -527,9 +525,8 @@ class TestRemoteComfyUISampler(unittest.TestCase):
                     enabled=True,
                     server_url=server.url,
                     workflow_path=wf_path,
-                    remote_lora_prefix="wrong_prefix",
+                    remote_lora_prefix="pc-a",
                     preflight_check="strict",
-                    preflight_sshfs_probe=True,
                 )
                 with self.assertRaises(RemoteComfyUIError) as ctx:
                     RemoteComfyUISampler(
@@ -547,20 +544,16 @@ class TestRemoteComfyUISampler(unittest.TestCase):
                     "prompt_input_node",
                     "ws_output_node",
                     "missing_model.safetensors",
-                    "sshfs_mount_probe",
                 ):
                     self.assertIn(expected, err)
-                # Sentinel file must be cleaned up even when preflight fails
-                self.assertEqual([fn for fn in os.listdir(job_dir) if "_aitk_remote_probe_" in fn], [])
 
                 # "warn" mode continues without raising
                 cfg_warn = RemoteComfyUIConfig(
                     enabled=True,
                     server_url=server.url,
                     workflow_path=wf_path,
-                    remote_lora_prefix="wrong_prefix",
+                    remote_lora_prefix="pc-a",
                     preflight_check="warn",
-                    preflight_sshfs_probe=True,
                 )
                 sampler_warn = RemoteComfyUISampler(
                     cfg_warn,
@@ -572,7 +565,7 @@ class TestRemoteComfyUISampler(unittest.TestCase):
                 )
                 try:
                     self.assertFalse(sampler_warn.preflight_report["ok"])
-                    self.assertGreaterEqual(len(sampler_warn.preflight_report["errors"]), 6)
+                    self.assertGreaterEqual(len(sampler_warn.preflight_report["errors"]), 5)
                 finally:
                     sampler_warn.stop()
 
