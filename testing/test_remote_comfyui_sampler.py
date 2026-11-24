@@ -20,12 +20,10 @@ try:
         RemoteComfyUIConfig,
         RemoteComfyUIError,
         RemoteComfyUISampler,
-        apply_node_overrides,
-        bind_titled_nodes,
         execute_comfyui_workflow_ws,
         extract_ws_image_bytes,
         find_titled_node_bindings,
-        render_workflow_template,
+        prepare_remote_workflow,
         resolve_remote_lora_name,
         rewrite_save_nodes_to_websocket,
     )
@@ -44,12 +42,10 @@ except ImportError:
     RemoteComfyUIConfig = _mod.RemoteComfyUIConfig
     RemoteComfyUIError = _mod.RemoteComfyUIError
     RemoteComfyUISampler = _mod.RemoteComfyUISampler
-    apply_node_overrides = _mod.apply_node_overrides
-    bind_titled_nodes = _mod.bind_titled_nodes
     execute_comfyui_workflow_ws = _mod.execute_comfyui_workflow_ws
     extract_ws_image_bytes = _mod.extract_ws_image_bytes
     find_titled_node_bindings = _mod.find_titled_node_bindings
-    render_workflow_template = _mod.render_workflow_template
+    prepare_remote_workflow = _mod.prepare_remote_workflow
     resolve_remote_lora_name = _mod.resolve_remote_lora_name
     rewrite_save_nodes_to_websocket = _mod.rewrite_save_nodes_to_websocket
 
@@ -198,7 +194,6 @@ class _MockComfyServer:
                 conn.sendall(resp)
                 with self._lock:
                     self._ws_clients[client_id] = conn
-                # Keep socket open until client closes or server stops.
                 while not self._stop.is_set():
                     time.sleep(0.05)
                 return
@@ -292,21 +287,21 @@ class _MockComfyServer:
 
     def _emit_ws_run(self, ws_conn: socket.socket, pid: str, wf: Dict) -> None:
         ws_node = next(nid for nid, node in wf.items() if node.get("class_type") == "SaveImageWebsocket")
-        # 1. Send a PING to verify client PONG handling.
+        # 1. PING -> PONG check
         ws_conn.sendall(_ws_server_frame(0x9, b"hi"))
-        # 2. Simulate KSampler executing and emitting an intermediate preview frame (MUST be ignored!).
+        # 2. Intermediate KSampler preview frame (MUST be ignored!)
         ws_conn.sendall(
-            _ws_server_frame(0x1, json.dumps({"type": "executing", "data": {"node": "3", "prompt_id": pid}}).encode())
+            _ws_server_frame(0x1, json.dumps({"type": "executing", "data": {"node": "1", "prompt_id": pid}}).encode())
         )
         bogus_preview = struct.pack(">II", 1, 1) + _make_png_bytes((255, 0, 0), (16, 16))
         ws_conn.sendall(_ws_server_frame(0x2, bogus_preview))
 
-        # 3. Execute SaveImageWebsocket node and stream a fragmented PNG!
+        # 3. SaveImageWebsocket node streams a 3-fragment PNG whose color encodes prompt text
         ws_conn.sendall(
             _ws_server_frame(0x1, json.dumps({"type": "executing", "data": {"node": ws_node, "prompt_id": pid}}).encode())
         )
-        seed = int(wf.get("3", {}).get("inputs", {}).get("seed", 0))
-        color = ((seed * 37) % 256, 128, 64)
+        prompt_text = str(wf.get("3", {}).get("inputs", {}).get("prompt", ""))
+        color = ((len(prompt_text) * 29) % 256, 128, 64)
         png = _make_png_bytes(color, (48, 32))
         if self.use_metadata_event:
             meta = json.dumps({"image_type": "image/png"}).encode("utf-8")
@@ -314,14 +309,13 @@ class _MockComfyServer:
         else:
             full_bin = struct.pack(">II", 1, 2) + png
 
-        # Split binary message into 3 WebSocket fragments to exercise continuation frames.
         cut1 = len(full_bin) // 3
         cut2 = (2 * len(full_bin)) // 3
         ws_conn.sendall(_ws_server_frame(0x2, full_bin[:cut1], fin=False))
         ws_conn.sendall(_ws_server_frame(0x0, full_bin[cut1:cut2], fin=False))
         ws_conn.sendall(_ws_server_frame(0x0, full_bin[cut2:], fin=True))
 
-        # 4. Signal execution completion.
+        # 4. Done
         ws_conn.sendall(
             _ws_server_frame(0x1, json.dumps({"type": "executing", "data": {"node": None, "prompt_id": pid}}).encode())
         )
@@ -330,17 +324,18 @@ class _MockComfyServer:
 class _DummyGenConfig:
     """Lightweight stand-in for GenerateImageConfig for standalone unit testing without torch."""
 
-    def __init__(self, out_dir: str, step: int, prompt: str, seed: int):
+    def __init__(self, out_dir: str, step: int, prompt: str):
         self.out_dir = out_dir
         self.step = step
         self.prompt = prompt
-        self.negative_prompt = "blurry"
-        self.network_multiplier = 0.85
-        self.seed = seed
-        self.num_inference_steps = 25
-        self.guidance_scale = 3.0
-        self.width = 1024
-        self.height = 768
+        # Local sample settings that MUST be ignored by remote ComfyUI:
+        self.negative_prompt = "local neg should be ignored"
+        self.network_multiplier = 0.123
+        self.seed = 999999
+        self.num_inference_steps = 99
+        self.guidance_scale = 12.5
+        self.width = 512
+        self.height = 512
         self.saved_paths: List[str] = []
 
     def save_image_atomic(self, image: Image.Image, count: int = 0, max_count: int = 0) -> None:
@@ -356,61 +351,59 @@ class TestRemoteComfyUISampler(unittest.TestCase):
             resolve_remote_lora_name(
                 "/data/output/my_job/my_job_000000200.safetensors",
                 "/data/output",
-                remote_lora_prefix="aitk_output",
+                remote_lora_prefix="pc-a",
                 path_separator="/",
             ),
-            "aitk_output/my_job/my_job_000000200.safetensors",
+            "pc-a/my_job/my_job_000000200.safetensors",
         )
         self.assertEqual(
             resolve_remote_lora_name(
                 "/data/output/my_job/my_job_000000200.safetensors",
                 "/data/output",
-                remote_lora_prefix="aitk_output",
+                remote_lora_prefix="pc-a",
                 path_separator="\\",
             ),
-            "aitk_output\\my_job\\my_job_000000200.safetensors",
+            "pc-a\\my_job\\my_job_000000200.safetensors",
         )
         with self.assertRaises(RemoteComfyUIError):
             resolve_remote_lora_name("/other/file.safetensors", "/data/output")
 
-    def test_overrides_template_and_ws_rewrite(self):
-        wf = {
-            "3": {"class_type": "KSampler", "inputs": {"seed": 1, "steps": 20, "cfg": 7.0}},
-            "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "old"}},
-            "10": {"class_type": "LoraLoader", "inputs": {"lora_name": "old.safetensors", "strength_model": 1.0}},
-            "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "ComfyUI", "images": ["8", 0]}},
+    def test_prepare_remote_workflow_modifies_only_2_inputs_and_1_output(self):
+        raw_wf = {
+            "1": {"class_type": "KSampler", "inputs": {"seed": 42, "steps": 8, "cfg": 1}},
+            "3": {
+                "class_type": "TextEncodeQwenImage21",
+                "inputs": {"prompt": "old prompt", "negative_prompt": "keep my neg", "resolution": 1024},
+                "_meta": {"title": "AITK_PROMPT"},
+            },
+            "11": {
+                "class_type": "LoraLoaderModelOnly",
+                "inputs": {"lora_name": "qi21/turbo.safetensors", "strength_model": 1.0, "model": ["5", 0]},
+                "_meta": {"title": "Load Turbo LoRA"},
+            },
+            "10": {
+                "class_type": "LoraLoaderModelOnly",
+                "inputs": {"lora_name": "dummy.safetensors", "strength_model": 0.75, "model": ["11", 0]},
+                "_meta": {"title": "AITK_LORA"},
+            },
+            "9": {"class_type": "PreviewImage", "inputs": {"images": ["2", 0]}},
         }
-        wf2 = apply_node_overrides(
-            wf,
-            {
-                "10.inputs.lora_name": "{{lora_name}}",
-                "10.inputs.strength_model": "{{lora_strength}}",
-                "6.inputs.text": "prefix {{prompt}}",
-                "3": {"seed": "{{seed}}", "steps": "{{steps}}", "cfg": "{{cfg}}"},
-            },
+        prepared, ws_nodes = prepare_remote_workflow(
+            raw_wf,
+            lora_name="pc-a/my_job/my_job_000000250.safetensors",
+            prompt="tester42, portrait",
         )
-        ws_wf, ws_nodes = rewrite_save_nodes_to_websocket(wf2, replace_save=True)
+        # 2 inputs modified:
+        self.assertEqual(prepared["10"]["inputs"]["lora_name"], "pc-a/my_job/my_job_000000250.safetensors")
+        self.assertEqual(prepared["3"]["inputs"]["prompt"], "tester42, portrait")
+        # 1 output modified:
         self.assertEqual(ws_nodes, {"9"})
-        self.assertEqual(ws_wf["9"]["class_type"], "SaveImageWebsocket")
-        self.assertEqual(ws_wf["9"]["inputs"], {"images": ["8", 0]})
-
-        rendered = render_workflow_template(
-            ws_wf,
-            {
-                "lora_name": "aitk/job/job_000000200.safetensors",
-                "lora_strength": 0.85,
-                "prompt": "a cat",
-                "seed": 42,
-                "steps": 25,
-                "cfg": 3.0,
-            },
-        )
-        self.assertEqual(rendered["10"]["inputs"]["lora_name"], "aitk/job/job_000000200.safetensors")
-        self.assertIs(type(rendered["10"]["inputs"]["strength_model"]), float)
-        self.assertAlmostEqual(rendered["10"]["inputs"]["strength_model"], 0.85)
-        self.assertEqual(rendered["6"]["inputs"]["text"], "prefix a cat")
-        self.assertIs(type(rendered["3"]["inputs"]["seed"]), int)
-        self.assertEqual(rendered["3"]["inputs"]["seed"], 42)
+        self.assertEqual(prepared["9"], {"class_type": "SaveImageWebsocket", "inputs": {"images": ["2", 0]}})
+        # Everything else untouched:
+        self.assertEqual(prepared["11"]["inputs"]["lora_name"], "qi21/turbo.safetensors")
+        self.assertEqual(prepared["10"]["inputs"]["strength_model"], 0.75)
+        self.assertEqual(prepared["3"]["inputs"]["negative_prompt"], "keep my neg")
+        self.assertEqual(prepared["1"]["inputs"], {"seed": 42, "steps": 8, "cfg": 1})
 
     def test_extract_ws_image_bytes(self):
         png = _make_png_bytes((1, 2, 3))
@@ -429,21 +422,37 @@ class TestRemoteComfyUISampler(unittest.TestCase):
             lora_file = os.path.join(job_dir, "my_job_000000200.safetensors")
             with open(lora_file, "wb") as f:
                 f.write(b"fake")
+            turbo_file = os.path.join(output_root, "turbo.safetensors")
+            with open(turbo_file, "wb") as f:
+                f.write(b"turbo")
 
             server = _MockComfyServer(
                 fail_first_n_not_in_list=2,
                 use_metadata_event=False,
                 loras_root=output_root,
-                loras_prefix="aitk_output",
+                loras_prefix="pc-a",
             )
             try:
                 wf_path = os.path.join(tmp, "workflow_api.json")
                 with open(wf_path, "w", encoding="utf-8") as f:
                     json.dump(
                         {
-                            "3": {"class_type": "KSampler", "inputs": {"seed": "{{seed}}", "steps": "{{steps}}", "cfg": "{{cfg}}"}},
-                            "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "{{prompt}}"}},
-                            "10": {"class_type": "LoraLoader", "inputs": {"lora_name": "{{lora_name}}", "strength_model": "{{lora_strength}}"}},
+                            "1": {"class_type": "KSampler", "inputs": {"seed": 42, "steps": 8, "cfg": 1}},
+                            "3": {
+                                "class_type": "TextEncodeQwenImage21",
+                                "inputs": {"prompt": "old", "negative_prompt": "workflow neg"},
+                                "_meta": {"title": "AITK_PROMPT"},
+                            },
+                            "11": {
+                                "class_type": "LoraLoaderModelOnly",
+                                "inputs": {"lora_name": "pc-a/turbo.safetensors", "strength_model": 1.0},
+                                "_meta": {"title": "Turbo LoRA"},
+                            },
+                            "10": {
+                                "class_type": "LoraLoaderModelOnly",
+                                "inputs": {"lora_name": "not_on_disk_placeholder.safetensors", "strength_model": 0.8},
+                                "_meta": {"title": "AITK_LORA"},
+                            },
                             "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "ComfyUI", "images": ["8", 0]}},
                         },
                         f,
@@ -453,28 +462,26 @@ class TestRemoteComfyUISampler(unittest.TestCase):
                     enabled=True,
                     server_url=server.url,
                     workflow_path=wf_path,
-                    remote_lora_prefix="aitk_output",
+                    remote_lora_prefix="pc-a",
                     lora_wait_retries=3,
                     lora_wait_interval=0.05,
                     request_timeout=10.0,
                     preflight_check="strict",
                     preflight_sshfs_probe=True,
                 )
-                logs: List[str] = []
                 sampler = RemoteComfyUISampler(
                     cfg,
                     training_folder=output_root,
                     job_name="my_job",
-                    log_fn=logs.append,
+                    log_fn=lambda _: None,
                     save_root=job_dir,
                     sample_prompts_count=2,
                 )
                 try:
                     self.assertTrue(sampler.preflight_report["ok"])
-                    # Ensure sentinel probe file was cleaned up immediately.
                     self.assertEqual([fn for fn in os.listdir(job_dir) if "_aitk_remote_probe_" in fn], [])
-                    c0 = _DummyGenConfig(samples_dir, 200, "portrait 1", seed=42)
-                    c1 = _DummyGenConfig(samples_dir, 200, "portrait 2", seed=43)
+                    c0 = _DummyGenConfig(samples_dir, 200, "short")
+                    c1 = _DummyGenConfig(samples_dir, 200, "longer prompt text")
                     sampler.enqueue(200, lora_file, [c0, c1])
                     self.assertTrue(sampler.wait_for_completion(timeout=10.0))
                     self.assertEqual(sampler.get_pending_lora_paths(), set())
@@ -482,38 +489,39 @@ class TestRemoteComfyUISampler(unittest.TestCase):
                     sampler.stop()
 
                 self.assertEqual(len(server.submitted_workflows), 2)
-                self.assertEqual(
-                    server.submitted_workflows[0]["10"]["inputs"]["lora_name"],
-                    "aitk_output/my_job/my_job_000000200.safetensors",
-                )
-                # Verify both images arrived from SaveImageWebsocket (not the 16x16 KSampler preview!).
-                for idx, (c, seed) in enumerate(((c0, 42), (c1, 43))):
+                submitted0 = server.submitted_workflows[0]
+                self.assertEqual(submitted0["10"]["inputs"]["lora_name"], "pc-a/my_job/my_job_000000200.safetensors")
+                self.assertEqual(submitted0["10"]["inputs"]["strength_model"], 0.8)  # local 0.123 ignored
+                self.assertEqual(submitted0["3"]["inputs"]["prompt"], "short")
+                self.assertEqual(submitted0["3"]["inputs"]["negative_prompt"], "workflow neg")  # local neg ignored
+                self.assertEqual(submitted0["1"]["inputs"]["steps"], 8)  # local 99 ignored
+                self.assertEqual(submitted0["1"]["inputs"]["seed"], 42)  # local 999999 ignored
+
+                for c, text in ((c0, "short"), (c1, "longer prompt text")):
                     self.assertEqual(len(c.saved_paths), 1)
                     img = Image.open(c.saved_paths[0])
                     self.assertEqual(img.size, (48, 32))
-                    self.assertEqual(img.getpixel((0, 0)), ((seed * 37) % 256, 128, 64))
+                    self.assertEqual(img.getpixel((0, 0)), ((len(text) * 29) % 256, 128, 64))
             finally:
                 server.close()
 
-    def test_preflight_catches_errors_and_respects_modes(self):
+    def test_preflight_requires_2_inputs_1_output_models_and_sshfs(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_root = os.path.join(tmp, "output")
             job_dir = os.path.join(output_root, "my_job")
             os.makedirs(job_dir, exist_ok=True)
-            wf_path = os.path.join(tmp, "wf.json")
+            wf_path = os.path.join(tmp, "bad_wf.json")
+            # Missing AITK_LORA, missing AITK_PROMPT, missing SaveImage/SaveImageWebsocket, missing UNET model
             with open(wf_path, "w", encoding="utf-8") as f:
                 json.dump(
                     {
                         "4": {"class_type": "QwenImage21Cache", "inputs": {"device": "auto", "dtype": "default"}},
                         "5": {"class_type": "UNETLoader", "inputs": {"unet_name": "missing_model.safetensors", "weight_dtype": "default"}},
-                        "10": {"class_type": "LoraLoaderModelOnly", "inputs": {"lora_name": "{{lora_name}}", "strength_model": "{{lora_strength}}"}},
-                        "9": {"class_type": "SaveImageWebsocket", "inputs": {"images": ["8", 0]}},
                     },
                     f,
                 )
 
-            # Mount prefix intentionally mismatches server's prefix ("wrong_prefix" vs "aitk_output")
-            server = _MockComfyServer(loras_root=output_root, loras_prefix="aitk_output")
+            server = _MockComfyServer(loras_root=output_root, loras_prefix="pc-a")
             try:
                 cfg_strict = RemoteComfyUIConfig(
                     enabled=True,
@@ -533,13 +541,19 @@ class TestRemoteComfyUISampler(unittest.TestCase):
                         sample_prompts_count=0,
                     )
                 err = str(ctx.exception)
-                self.assertIn("samples_non_empty", err)
-                self.assertIn("missing_model.safetensors", err)
-                self.assertIn("sshfs_mount_probe", err)
-                # Sentinel file must be cleaned up even when preflight raises!
+                for expected in (
+                    "samples_non_empty",
+                    "lora_input_node",
+                    "prompt_input_node",
+                    "ws_output_node",
+                    "missing_model.safetensors",
+                    "sshfs_mount_probe",
+                ):
+                    self.assertIn(expected, err)
+                # Sentinel file must be cleaned up even when preflight fails
                 self.assertEqual([fn for fn in os.listdir(job_dir) if "_aitk_remote_probe_" in fn], [])
 
-                # Same config in "warn" mode must succeed and record the errors in preflight_report.
+                # "warn" mode continues without raising
                 cfg_warn = RemoteComfyUIConfig(
                     enabled=True,
                     server_url=server.url,
@@ -558,11 +572,11 @@ class TestRemoteComfyUISampler(unittest.TestCase):
                 )
                 try:
                     self.assertFalse(sampler_warn.preflight_report["ok"])
-                    self.assertGreaterEqual(len(sampler_warn.preflight_report["errors"]), 3)
+                    self.assertGreaterEqual(len(sampler_warn.preflight_report["errors"]), 6)
                 finally:
                     sampler_warn.stop()
 
-                # "off" mode skips preflight completely (even with an unreachable server URL).
+                # "off" mode skips preflight completely
                 cfg_off = RemoteComfyUIConfig(
                     enabled=True,
                     server_url="http://127.0.0.1:1",
@@ -584,96 +598,18 @@ class TestRemoteComfyUISampler(unittest.TestCase):
             finally:
                 server.close()
 
-    def test_titled_node_binding_preserves_user_workflow_params(self):
-        # Raw ComfyUI API export with TWO LoRAs (Turbo + training LoRA titled AITK_LORA) and AITK_PROMPT
-        raw_wf = {
-            "1": {"class_type": "KSampler", "inputs": {"seed": 42, "steps": 8, "cfg": 1}},
-            "3": {
-                "class_type": "TextEncodeQwenImage21",
-                "inputs": {"prompt": "old prompt", "negative_prompt": "keep my neg", "resolution": 1024},
-                "_meta": {"title": "AITK_PROMPT"},
-            },
-            "11": {
-                "class_type": "LoraLoaderModelOnly",
-                "inputs": {"lora_name": "qi21/turbo.safetensors", "strength_model": 1.0, "model": ["5", 0]},
-                "_meta": {"title": "Load Turbo LoRA"},
-            },
-            "10": {
-                "class_type": "LoraLoaderModelOnly",
-                "inputs": {"lora_name": "some_dummy_lora_not_on_disk.safetensors", "strength_model": 0.75, "model": ["11", 0]},
-                "_meta": {"title": "AITK_LORA"},
-            },
-            "9": {"class_type": "PreviewImage", "inputs": {"images": ["2", 0]}},
-        }
-        bound, bindings = bind_titled_nodes(
-            raw_wf,
-            lora_name="pc-a/my_job/my_job_000000250.safetensors",
-            prompt="tester42, portrait",
-            negative_prompt="ignored because no AITK_NEG_PROMPT",
-        )
-        self.assertEqual(bindings["lora"], [("10", "lora_name")])
-        self.assertEqual(bindings["prompt"], [("3", "prompt")])
-        # Training LoRA & prompt replaced:
-        self.assertEqual(bound["10"]["inputs"]["lora_name"], "pc-a/my_job/my_job_000000250.safetensors")
-        self.assertEqual(bound["3"]["inputs"]["prompt"], "tester42, portrait")
-        # All user-chosen workflow params stay 100% untouched:
-        self.assertEqual(bound["11"]["inputs"]["lora_name"], "qi21/turbo.safetensors")
-        self.assertEqual(bound["10"]["inputs"]["strength_model"], 0.75)
-        self.assertEqual(bound["3"]["inputs"]["negative_prompt"], "keep my neg")
-        self.assertEqual(bound["1"]["inputs"]["steps"], 8)
-        self.assertEqual(bound["1"]["inputs"]["cfg"], 1)
-
-        # Preflight must skip validating placeholder lora_name on AITK_LORA while STILL validating Turbo LoRA on "11"
-        with tempfile.TemporaryDirectory() as tmp:
-            output_root = os.path.join(tmp, "output")
-            job_dir = os.path.join(output_root, "my_job")
-            os.makedirs(job_dir, exist_ok=True)
-            turbo_file = os.path.join(output_root, "turbo.safetensors")
-            with open(turbo_file, "wb") as f:
-                f.write(b"x")
-            raw_wf["11"]["inputs"]["lora_name"] = "pc-a/turbo.safetensors"
-            wf_path = os.path.join(tmp, "raw_8steps.json")
-            with open(wf_path, "w", encoding="utf-8") as f:
-                json.dump(raw_wf, f)
-
-            server = _MockComfyServer(loras_root=output_root, loras_prefix="pc-a")
-            try:
-                cfg = RemoteComfyUIConfig(
-                    enabled=True,
-                    server_url=server.url,
-                    workflow_path=wf_path,
-                    remote_lora_prefix="pc-a",
-                    preflight_check="strict",
-                    preflight_sshfs_probe=True,
-                )
-                sampler = RemoteComfyUISampler(
-                    cfg,
-                    training_folder=output_root,
-                    job_name="my_job",
-                    log_fn=lambda _: None,
-                    save_root=job_dir,
-                    sample_prompts_count=1,
-                )
-                try:
-                    self.assertTrue(sampler.preflight_report["ok"])
-                    self.assertEqual(sampler.preflight_report["warnings"], [])
-                finally:
-                    sampler.stop()
-            finally:
-                server.close()
-
     def test_metadata_binary_event(self):
         server = _MockComfyServer(fail_first_n_not_in_list=0, use_metadata_event=True)
         try:
             wf = {
-                "3": {"class_type": "KSampler", "inputs": {"seed": 7}},
+                "3": {"class_type": "TextEncodeQwenImage21", "inputs": {"prompt": "hello"}},
                 "9": {"class_type": "SaveImageWebsocket", "inputs": {"images": ["8", 0]}},
             }
             imgs = execute_comfyui_workflow_ws(server.url, wf, {"9"}, request_timeout=10.0)
             self.assertEqual(len(imgs), 1)
             img = Image.open(io.BytesIO(imgs[0]))
             self.assertEqual(img.size, (48, 32))
-            self.assertEqual(img.getpixel((0, 0)), ((7 * 37) % 256, 128, 64))
+            self.assertEqual(img.getpixel((0, 0)), ((len("hello") * 29) % 256, 128, 64))
         finally:
             server.close()
 

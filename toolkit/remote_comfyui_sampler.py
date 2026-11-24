@@ -1,15 +1,19 @@
 """Non-blocking remote ComfyUI preview sampler for ai-toolkit.
 
 When Machine A finishes saving a LoRA checkpoint, this module enqueues a
-background preview job without pausing training. A worker thread submits the
-user's exported ComfyUI API workflow JSON to Machine B over LAN, rewrites any
-SaveImage / PreviewImage node to ComfyUI's built-in SaveImageWebsocket node so
-nothing is written to Machine B's filesystem, streams the resulting PNG bytes
-back over WebSocket, and saves them atomically into Machine A's job `samples/`
-folder (with `.thumbs/`) so the ai-toolkit Web UI displays them automatically.
+background preview job without pausing training. A worker thread takes the
+user's raw ComfyUI API-exported workflow JSON, modifies ONLY:
+  1. Input 1 (`AITK_LORA` node title)   -> sets `lora_name` to the saved checkpoint
+  2. Input 2 (`AITK_PROMPT` node title) -> sets `prompt`/`text` to each sample prompt
+  3. Output  (`SaveImage`/`PreviewImage`) -> rewrites to `SaveImageWebsocket`
 
-Uses only Python's standard library + `requests` + `Pillow` (no external
-websocket library required).
+All other workflow parameters (steps, cfg, seed, width, height, negative prompt,
+LoRA strength, turbo LoRA, sampler, etc.) remain untouched as configured by the
+user in ComfyUI. Generated PNG bytes stream back over WebSocket (zero files
+written to Machine B's disk) and are saved atomically into Machine A's job
+`samples/` folder (with `.thumbs/`) so the ai-toolkit Web UI displays them.
+
+Uses only Python's standard library + `requests` + `Pillow`.
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ import threading
 import time
 import urllib.parse
 import uuid
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
 import requests
 from PIL import Image
@@ -53,13 +57,9 @@ class RemoteComfyUIConfig:
         self.path_separator: str = kwargs.get('path_separator', '/')
         # Automatically convert SaveImage / PreviewImage nodes to SaveImageWebsocket so 0 files hit Machine B's disk
         self.replace_save_with_websocket: bool = kwargs.get('replace_save_with_websocket', True)
-        # Node titles (_meta.title) renamed in ComfyUI UI so raw API-exported JSON needs zero manual editing
-        self.lora_node_title: str = str(kwargs.get('lora_node_title', 'AITK_LORA') or '')
-        self.prompt_node_title: str = str(kwargs.get('prompt_node_title', 'AITK_PROMPT') or '')
-        self.neg_prompt_node_title: str = str(kwargs.get('neg_prompt_node_title', 'AITK_NEG_PROMPT') or '')
-        # Optional overrides applied to workflow JSON before placeholder substitution:
-        #   {"10.inputs.lora_name": "{{lora_name}}", "6.inputs.text": "{{prompt}}"}
-        self.node_overrides: dict = kwargs.get('node_overrides', {}) or {}
+        # Two ComfyUI node titles (_meta.title) renamed by the user in ComfyUI UI:
+        self.lora_node_title: str = str(kwargs.get('lora_node_title', 'AITK_LORA') or 'AITK_LORA')
+        self.prompt_node_title: str = str(kwargs.get('prompt_node_title', 'AITK_PROMPT') or 'AITK_PROMPT')
         # Trigger remote preview on every checkpoint save (if False, only on save steps divisible by sample_every)
         self.sample_on_save: bool = kwargs.get('sample_on_save', True)
         # Skip local GPU sampling on Machine A so training never pauses
@@ -77,14 +77,17 @@ class RemoteComfyUIConfig:
         # Write+delete a 0-byte sentinel .safetensors in save_root to prove sshfs + remote_lora_prefix work
         self.preflight_sshfs_probe: bool = bool(kwargs.get('preflight_sshfs_probe', True))
 
+
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _BINARY_EVENT_PREVIEW_IMAGE = 1
 _BINARY_EVENT_PREVIEW_IMAGE_WITH_METADATA = 4
 _SAVE_NODE_CLASSES = ("SaveImage", "PreviewImage")
+_LORA_FIELD_CANDIDATES = ("lora_name", "lora")
+_PROMPT_FIELD_CANDIDATES = ("prompt", "text", "string", "value", "positive")
 
 
 class RemoteComfyUIError(RuntimeError):
-    """Raised when a remote ComfyUI prompt submission or WebSocket read fails."""
+    """Raised when a remote ComfyUI preflight check, prompt submission, or WebSocket read fails."""
 
 
 class _StdlibWebSocket:
@@ -317,11 +320,6 @@ def resolve_remote_lora_name(
     return sep.join(parts)
 
 
-_LORA_FIELD_CANDIDATES = ("lora_name", "lora")
-_PROMPT_FIELD_CANDIDATES = ("prompt", "text", "string", "value", "positive")
-_NEG_PROMPT_FIELD_CANDIDATES = ("negative_prompt", "text", "prompt", "string", "value", "negative")
-
-
 def _node_title(node: Any) -> str:
     if not isinstance(node, dict):
         return ""
@@ -342,19 +340,17 @@ def find_titled_node_bindings(
     workflow: Dict[str, Any],
     lora_node_title: str = "AITK_LORA",
     prompt_node_title: str = "AITK_PROMPT",
-    neg_prompt_node_title: str = "AITK_NEG_PROMPT",
 ) -> Dict[str, List[Tuple[str, str]]]:
-    """Find nodes renamed in ComfyUI UI (_meta.title) for ai-toolkit binding.
+    """Find the 2 input nodes renamed in ComfyUI UI (_meta.title): LoRA and Prompt.
 
-    Returns {"lora": [(node_id, field), ...], "prompt": [...], "neg_prompt": [...]}.
+    Returns {"lora": [(node_id, field), ...], "prompt": [(node_id, field), ...]}.
     Matching is case-insensitive on stripped _meta.title.
     """
     targets = {
         "lora": (lora_node_title.strip().lower(), _LORA_FIELD_CANDIDATES),
         "prompt": (prompt_node_title.strip().lower(), _PROMPT_FIELD_CANDIDATES),
-        "neg_prompt": (neg_prompt_node_title.strip().lower(), _NEG_PROMPT_FIELD_CANDIDATES),
     }
-    found: Dict[str, List[Tuple[str, str]]] = {"lora": [], "prompt": [], "neg_prompt": []}
+    found: Dict[str, List[Tuple[str, str]]] = {"lora": [], "prompt": []}
     for nid, node in workflow.items():
         if not isinstance(node, dict):
             continue
@@ -372,95 +368,30 @@ def find_titled_node_bindings(
     return found
 
 
-def bind_titled_nodes(
+def prepare_remote_workflow(
     workflow: Dict[str, Any],
-    lora_name: Optional[str] = None,
-    prompt: Optional[str] = None,
-    negative_prompt: Optional[str] = None,
+    lora_name: str,
+    prompt: str,
     lora_node_title: str = "AITK_LORA",
     prompt_node_title: str = "AITK_PROMPT",
-    neg_prompt_node_title: str = "AITK_NEG_PROMPT",
-) -> Tuple[Dict[str, Any], Dict[str, List[Tuple[str, str]]]]:
-    """Inject lora_name / prompt / negative_prompt into nodes renamed in ComfyUI UI.
+    replace_save: bool = True,
+) -> Tuple[Dict[str, Any], Set[str]]:
+    """Modify ONLY the 2 input nodes (LoRA, Prompt) and 1 output node (SaveImageWebsocket).
 
-    Leaves all other sampler params (steps, cfg, seed, width, height, strength, etc.)
-    untouched — those stay the user's responsibility in their ComfyUI workflow.
+    All other workflow settings (steps, cfg, seed, width, height, negative prompt,
+    LoRA strength, turbo LoRA, etc.) stay untouched as exported from ComfyUI.
     """
-    wf = copy.deepcopy(workflow)
+    wf, ws_nodes = rewrite_save_nodes_to_websocket(workflow, replace_save=replace_save)
     bindings = find_titled_node_bindings(
         wf,
         lora_node_title=lora_node_title,
         prompt_node_title=prompt_node_title,
-        neg_prompt_node_title=neg_prompt_node_title,
     )
-    if lora_name is not None:
-        for nid, field in bindings["lora"]:
-            wf[nid]["inputs"][field] = lora_name
-    if prompt is not None:
-        for nid, field in bindings["prompt"]:
-            wf[nid]["inputs"][field] = prompt
-    if negative_prompt is not None and negative_prompt != "":
-        for nid, field in bindings["neg_prompt"]:
-            wf[nid]["inputs"][field] = negative_prompt
-    return wf, bindings
-
-
-def apply_node_overrides(workflow: Dict[str, Any], overrides: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Apply YAML node_overrides onto a copy of a ComfyUI API workflow dict.
-
-    Supports both:
-      - dotted paths: {"10.inputs.lora_name": "{{lora_name}}"}
-      - nested dicts: {"10": {"lora_name": "{{lora_name}}"}}
-    """
-    wf = copy.deepcopy(workflow)
-    if not overrides:
-        return wf
-
-    for key, value in overrides.items():
-        if isinstance(value, dict) and "." not in key:
-            node_id = str(key)
-            if node_id not in wf:
-                raise RemoteComfyUIError(f"node_overrides references unknown node ID {node_id!r}")
-            inputs = wf[node_id].setdefault("inputs", {})
-            for field, field_val in value.items():
-                inputs[field] = copy.deepcopy(field_val)
-            continue
-
-        parts = str(key).split(".")
-        if len(parts) < 2:
-            raise RemoteComfyUIError(
-                f"Invalid node_overrides key {key!r}; expected '<node_id>.inputs.<field>' or nested dict"
-            )
-        node_id = parts[0]
-        if node_id not in wf:
-            raise RemoteComfyUIError(f"node_overrides references unknown node ID {node_id!r}")
-        target = wf[node_id]
-        for seg in parts[1:-1]:
-            if seg not in target or not isinstance(target[seg], dict):
-                target[seg] = {}
-            target = target[seg]
-        target[parts[-1]] = copy.deepcopy(value)
-    return wf
-
-
-def render_workflow_template(workflow: Any, variables: Dict[str, Any]) -> Any:
-    """Recursively substitute {{var}} placeholders, preserving numeric types on exact matches."""
-    if isinstance(workflow, dict):
-        return {k: render_workflow_template(v, variables) for k, v in workflow.items()}
-    if isinstance(workflow, list):
-        return [render_workflow_template(v, variables) for v in workflow]
-    if isinstance(workflow, str):
-        for name, val in variables.items():
-            token = "{{" + name + "}}"
-            if workflow == token:
-                return val
-        out = workflow
-        for name, val in variables.items():
-            token = "{{" + name + "}}"
-            if token in out:
-                out = out.replace(token, "" if val is None else str(val))
-        return out
-    return workflow
+    for nid, field in bindings["lora"]:
+        wf[nid]["inputs"][field] = lora_name
+    for nid, field in bindings["prompt"]:
+        wf[nid]["inputs"][field] = prompt
+    return wf, ws_nodes
 
 
 def rewrite_save_nodes_to_websocket(
@@ -620,16 +551,6 @@ def _extract_combo_options(input_spec: Any) -> Optional[List[Any]]:
     return None
 
 
-def _workflow_contains_placeholder(obj: Any, token: str) -> bool:
-    if isinstance(obj, str):
-        return token in obj
-    if isinstance(obj, dict):
-        return any(_workflow_contains_placeholder(v, token) for v in obj.values())
-    if isinstance(obj, list):
-        return any(_workflow_contains_placeholder(v, token) for v in obj)
-    return False
-
-
 class RemoteComfyUISampler:
     """Background FIFO worker that dispatches checkpoint previews to a LAN ComfyUI machine."""
 
@@ -683,7 +604,7 @@ class RemoteComfyUISampler:
         )
 
     def run_preflight(self, strict: bool = False) -> Dict[str, Any]:
-        """Run fast (<1s) startup validation of local config, workflow, Machine B, and sshfs mount."""
+        """Validate the 2 input nodes (LoRA, Prompt), 1 output node (WS), Machine B, and sshfs mount."""
         checks: List[Tuple[str, str, str]] = []  # (name, status, detail)
         errors: List[str] = []
         warnings: List[str] = []
@@ -706,68 +627,46 @@ class RemoteComfyUISampler:
             else:
                 record("samples_non_empty", "PASS", f"{self.sample_prompts_count} prompt(s) configured")
 
-        # 2. node_overrides
-        overridden_wf: Optional[Dict[str, Any]] = None
-        try:
-            overridden_wf = apply_node_overrides(self._workflow_template, self.config.node_overrides)
-            record("node_overrides", "PASS", f"{len(self.config.node_overrides)} override(s) valid")
-        except Exception as e:
-            record("node_overrides", "FAIL", str(e))
+        # 2. Check the 2 input nodes (AITK_LORA + AITK_PROMPT) and 1 output node (SaveImageWebsocket)
+        ws_wf, ws_node_ids = rewrite_save_nodes_to_websocket(
+            self._workflow_template, replace_save=self.config.replace_save_with_websocket
+        )
+        bindings = find_titled_node_bindings(
+            ws_wf,
+            lora_node_title=self.config.lora_node_title,
+            prompt_node_title=self.config.prompt_node_title,
+        )
 
-        # 3. WebSocket output node
-        ws_wf: Optional[Dict[str, Any]] = None
-        ws_node_ids: Set[str] = set()
-        if overridden_wf is not None:
-            ws_wf, ws_node_ids = rewrite_save_nodes_to_websocket(
-                overridden_wf, replace_save=self.config.replace_save_with_websocket
+        if bindings["lora"]:
+            desc = ", ".join(f"node {nid}.{fld}" for nid, fld in bindings["lora"])
+            record("lora_input_node", "PASS", f"title {self.config.lora_node_title!r} -> {desc}")
+        else:
+            record(
+                "lora_input_node",
+                "FAIL",
+                f"no node titled {self.config.lora_node_title!r} with a lora_name input found in workflow",
             )
-            if ws_node_ids:
-                record("ws_output_node", "PASS", f"SaveImageWebsocket node(s): {sorted(ws_node_ids)}")
-            else:
-                record(
-                    "ws_output_node",
-                    "FAIL",
-                    "workflow has no SaveImageWebsocket (nor SaveImage/PreviewImage to rewrite)",
-                )
 
-        # 4. LoRA & Prompt bindings (either renamed ComfyUI node titles OR {{...}} placeholders)
-        bindings: Dict[str, List[Tuple[str, str]]] = {"lora": [], "prompt": [], "neg_prompt": []}
-        if ws_wf is not None:
-            bindings = find_titled_node_bindings(
-                ws_wf,
-                lora_node_title=self.config.lora_node_title,
-                prompt_node_title=self.config.prompt_node_title,
-                neg_prompt_node_title=self.config.neg_prompt_node_title,
+        if bindings["prompt"]:
+            desc = ", ".join(f"node {nid}.{fld}" for nid, fld in bindings["prompt"])
+            record("prompt_input_node", "PASS", f"title {self.config.prompt_node_title!r} -> {desc}")
+        else:
+            record(
+                "prompt_input_node",
+                "FAIL",
+                f"no node titled {self.config.prompt_node_title!r} with a prompt/text input found in workflow",
             )
-            has_lora_placeholder = _workflow_contains_placeholder(ws_wf, "{{lora_name}}")
-            if bindings["lora"]:
-                desc = ", ".join(f"node {nid}.{fld}" for nid, fld in bindings["lora"])
-                record("lora_binding", "PASS", f"title {self.config.lora_node_title!r} -> {desc}")
-            elif has_lora_placeholder:
-                record("lora_binding", "PASS", "{{lora_name}} placeholder found in workflow")
-            else:
-                record(
-                    "lora_binding",
-                    "WARN",
-                    f"no node titled {self.config.lora_node_title!r} and no {{{{lora_name}}}} placeholder found; "
-                    "saved checkpoints will not be substituted",
-                )
 
-            has_prompt_placeholder = _workflow_contains_placeholder(ws_wf, "{{prompt}}")
-            if bindings["prompt"]:
-                desc = ", ".join(f"node {nid}.{fld}" for nid, fld in bindings["prompt"])
-                record("prompt_binding", "PASS", f"title {self.config.prompt_node_title!r} -> {desc}")
-            elif has_prompt_placeholder:
-                record("prompt_binding", "PASS", "{{prompt}} placeholder found in workflow")
-            else:
-                record(
-                    "prompt_binding",
-                    "WARN",
-                    f"no node titled {self.config.prompt_node_title!r} and no {{{{prompt}}}} placeholder found; "
-                    "workflow's hardcoded prompt will be used as-is",
-                )
+        if ws_node_ids:
+            record("ws_output_node", "PASS", f"SaveImageWebsocket node(s): {sorted(ws_node_ids)}")
+        else:
+            record(
+                "ws_output_node",
+                "FAIL",
+                "workflow has no SaveImageWebsocket (nor SaveImage/PreviewImage to rewrite)",
+            )
 
-        # 5. Local-to-remote LoRA path mapping
+        # 3. Local-to-remote LoRA path mapping
         sample_remote_lora: Optional[str] = None
         try:
             dummy_ckpt = os.path.join(self.save_root, f"{self.job_name}_000000001.safetensors")
@@ -784,7 +683,7 @@ class RemoteComfyUISampler:
         base_url = self.config.server_url.strip().rstrip("/")
         timeout = max(1.0, float(self.config.preflight_timeout))
 
-        # 6. Machine B HTTP /system_stats
+        # 4. Machine B HTTP /system_stats
         server_ok = False
         try:
             resp = requests.get(f"{base_url}/system_stats", timeout=timeout)
@@ -800,7 +699,7 @@ class RemoteComfyUISampler:
         except Exception as e:
             record("server_reachable", "FAIL", f"cannot reach {base_url}/system_stats: {e}")
 
-        # 7. Machine B WebSocket handshake
+        # 5. Machine B WebSocket handshake
         if server_ok:
             ws_url = http_to_ws_url(base_url, f"preflight-{uuid.uuid4().hex[:8]}")
             try:
@@ -810,9 +709,9 @@ class RemoteComfyUISampler:
             except Exception as e:
                 record("websocket_handshake", "FAIL", f"WebSocket upgrade failed ({ws_url}): {e}")
 
-        # 8. Workflow node classes & static combo values (unet/clip/vae/sampler/etc.)
+        # 6. Workflow node classes & static model/combo inputs on Machine B
         fetched_object_info: Dict[str, Dict[str, Any]] = {}
-        if server_ok and ws_wf is not None:
+        if server_ok:
             class_types = sorted(
                 {
                     str(node.get("class_type"))
@@ -843,11 +742,9 @@ class RemoteComfyUISampler:
             else:
                 record("workflow_nodes", "PASS", f"all {len(class_types)} node class(es) available on Machine B")
 
-            # Validate static combo inputs (e.g. unet_name, clip_name, vae_name, turbo lora_name, sampler_name)
-            # Skip fields bound to dynamic AITK_LORA / AITK_PROMPT / AITK_NEG_PROMPT targets.
             dynamic_fields = {
                 (nid, fld)
-                for role in ("lora", "prompt", "neg_prompt")
+                for role in ("lora", "prompt")
                 for nid, fld in bindings[role]
             }
             for nid, node in ws_wf.items():
@@ -866,7 +763,7 @@ class RemoteComfyUISampler:
                 for field, val in (node.get("inputs") or {}).items():
                     if (str(nid), field) in dynamic_fields:
                         continue
-                    if not isinstance(val, str) or "{{" in val:
+                    if not isinstance(val, str):
                         continue
                     options = _extract_combo_options(all_specs.get(field))
                     if options is not None and val not in options:
@@ -881,7 +778,7 @@ class RemoteComfyUISampler:
             elif not missing_classes:
                 record("workflow_models", "PASS", "all static model/combo inputs verified on Machine B")
 
-        # 9. End-to-end sshfs + remote_lora_prefix sentinel probe
+        # 7. End-to-end sshfs + remote_lora_prefix sentinel probe
         if server_ok and self.config.preflight_sshfs_probe and sample_remote_lora is not None:
             lora_cls = None
             for candidate in ("LoraLoaderModelOnly", "LoraLoader"):
@@ -954,7 +851,6 @@ class RemoteComfyUISampler:
                     except OSError:
                         pass
 
-        # Print concise preflight summary
         self.log_fn(f"[RemoteComfyUI] Startup preflight ({base_url}):")
         for name, status, detail in checks:
             self.log_fn(f"  [{status}] {name}: {detail}")
@@ -1076,11 +972,6 @@ class RemoteComfyUISampler:
             path_separator=self.config.path_separator,
         )
         base_wf = self._get_latest_workflow()
-        overridden_wf = apply_node_overrides(base_wf, self.config.node_overrides)
-        ws_wf, ws_node_ids = rewrite_save_nodes_to_websocket(
-            overridden_wf, replace_save=self.config.replace_save_with_websocket
-        )
-
         total = len(image_configs)
         saved_count = 0
         t0 = time.monotonic()
@@ -1088,29 +979,14 @@ class RemoteComfyUISampler:
         for idx, gen_cfg in enumerate(image_configs):
             if self._stop_event.is_set():
                 break
-            variables = {
-                "prompt": gen_cfg.prompt or "",
-                "negative_prompt": gen_cfg.negative_prompt or "",
-                "lora_name": lora_name,
-                "lora_strength": float(gen_cfg.network_multiplier),
-                "seed": int(gen_cfg.seed),
-                "steps": int(gen_cfg.num_inference_steps),
-                "cfg": float(gen_cfg.guidance_scale),
-                "width": int(gen_cfg.width),
-                "height": int(gen_cfg.height),
-                "step": int(step),
-                "job_name": self.job_name,
-            }
-            bound_wf, _ = bind_titled_nodes(
-                ws_wf,
+            rendered_wf, ws_node_ids = prepare_remote_workflow(
+                base_wf,
                 lora_name=lora_name,
                 prompt=gen_cfg.prompt or "",
-                negative_prompt=gen_cfg.negative_prompt or "",
                 lora_node_title=self.config.lora_node_title,
                 prompt_node_title=self.config.prompt_node_title,
-                neg_prompt_node_title=self.config.neg_prompt_node_title,
+                replace_save=self.config.replace_save_with_websocket,
             )
-            rendered_wf = render_workflow_template(bound_wf, variables)
             try:
                 raw_images = execute_comfyui_workflow_ws(
                     server_url=self.config.server_url,
@@ -1147,24 +1023,19 @@ class RemoteComfyUISampler:
 
 def _cli() -> None:
     parser = argparse.ArgumentParser(
-        description="Test streaming a preview image from a remote ComfyUI server via SaveImageWebsocket."
+        description="Preflight or stream a preview image from a remote ComfyUI server via SaveImageWebsocket."
     )
-    parser.add_argument("--server", required=True, help="ComfyUI server URL, e.g. http://192.168.1.50:8188")
+    parser.add_argument("--server", required=True, help="ComfyUI server URL, e.g. http://pc-b:8188")
     parser.add_argument("--workflow", required=True, help="Path to ComfyUI API-format workflow.json")
-    parser.add_argument("--lora", default=None, help="LoRA name as seen by ComfyUI on Machine B (required unless --preflight)")
+    parser.add_argument("--lora", default=None, help="LoRA name on Machine B (required unless --preflight)")
+    parser.add_argument("--prompt", default="a portrait photo", help="Prompt injected into AITK_PROMPT node")
+    parser.add_argument("--lora-title", default="AITK_LORA", help="ComfyUI node title for training LoRA")
+    parser.add_argument("--prompt-title", default="AITK_PROMPT", help="ComfyUI node title for prompt")
     parser.add_argument("--preflight", action="store_true", help="Run startup preflight checks only (no image render)")
     parser.add_argument("--local-root", default=None, help="Local output root on Machine A for --preflight sshfs probe")
     parser.add_argument("--save-root", default=None, help="Job save_root on Machine A for --preflight sshfs probe")
     parser.add_argument("--prefix", default="", help="remote_lora_prefix for --preflight sshfs probe")
     parser.add_argument("--no-sshfs-probe", action="store_true", help="Skip sentinel .safetensors check during --preflight")
-    parser.add_argument("--prompt", default="a portrait photo", help="Positive prompt")
-    parser.add_argument("--neg", default="", help="Negative prompt")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--steps", type=int, default=25)
-    parser.add_argument("--cfg", type=float, default=3.0)
-    parser.add_argument("--width", type=int, default=1024)
-    parser.add_argument("--height", type=int, default=1024)
-    parser.add_argument("--strength", type=float, default=1.0)
     parser.add_argument("--output", default="./remote_comfyui_test.png", help="Output path on Machine A")
     args = parser.parse_args()
 
@@ -1177,6 +1048,8 @@ def _cli() -> None:
             workflow_path=args.workflow,
             remote_lora_prefix=args.prefix,
             local_root=local_root,
+            lora_node_title=args.lora_title,
+            prompt_node_title=args.prompt_title,
             preflight_check="strict",
             preflight_sshfs_probe=not args.no_sshfs_probe,
         )
@@ -1195,28 +1068,13 @@ def _cli() -> None:
 
     with open(args.workflow, "r", encoding="utf-8") as f:
         wf = json.load(f)
-    ws_wf, ws_nodes = rewrite_save_nodes_to_websocket(wf, replace_save=True)
-    bound_wf, _ = bind_titled_nodes(
-        ws_wf,
+    rendered, ws_nodes = prepare_remote_workflow(
+        wf,
         lora_name=args.lora,
         prompt=args.prompt,
-        negative_prompt=args.neg,
-    )
-    rendered = render_workflow_template(
-        bound_wf,
-        {
-            "prompt": args.prompt,
-            "negative_prompt": args.neg,
-            "lora_name": args.lora,
-            "lora_strength": args.strength,
-            "seed": args.seed,
-            "steps": args.steps,
-            "cfg": args.cfg,
-            "width": args.width,
-            "height": args.height,
-            "step": 0,
-            "job_name": "test",
-        },
+        lora_node_title=args.lora_title,
+        prompt_node_title=args.prompt_title,
+        replace_save=True,
     )
     imgs = execute_comfyui_workflow_ws(args.server, rendered, ws_nodes)
     if not imgs:

@@ -73,5 +73,5 @@ Defined in `/etc/hosts`:
     --workflow /home/yzhang/Desktop/ai-toolkit/docs/workflows/lora_tester_qi21_api.json \
     --lora mine/qi21/tz_qi21_74img_768_autov3.safetensors \
     --prompt "a portrait of woman" \
-    --steps 10 --output /home/yzhang/Desktop/ai-toolkit/work/pc_b_live_test.png
+    --output /home/yzhang/Desktop/ai-toolkit/work/pc_b_live_test.png
   ```

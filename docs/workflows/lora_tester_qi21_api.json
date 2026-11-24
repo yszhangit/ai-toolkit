@@ -1,9 +1,9 @@
 {
   "1": {
     "inputs": {
-      "seed": "{{seed}}",
-      "steps": "{{steps}}",
-      "cfg": "{{cfg}}",
+      "seed": 42,
+      "steps": 25,
+      "cfg": 3.5,
       "sampler_name": "euler",
       "scheduler": "simple",
       "denoise": 1,
@@ -47,9 +47,9 @@
   },
   "3": {
     "inputs": {
-      "prompt": "{{prompt}}",
-      "negative_prompt": "{{negative_prompt}}",
-      "resolution": "{{width}}",
+      "prompt": "a portrait of woman",
+      "negative_prompt": "blurry, low resolution, artifacts, washed-out colors, oversharpening, noise, grain, badly drawn hands, missing fingers, distorted anatomy, indistinct text, cartoon, 3D render, CGI, anime, rough sketch",
+      "resolution": 1024,
       "clip": [
         "6",
         0
@@ -57,7 +57,7 @@
     },
     "class_type": "TextEncodeQwenImage21",
     "_meta": {
-      "title": "Text Encode Qwen Image 2.1"
+      "title": "AITK_PROMPT"
     }
   },
   "4": {
@@ -106,8 +106,8 @@
   },
   "8": {
     "inputs": {
-      "width": "{{width}}",
-      "height": "{{height}}",
+      "width": 1024,
+      "height": 1024,
       "batch_size": 1
     },
     "class_type": "EmptyLatentImage",
@@ -122,15 +122,15 @@
         0
       ]
     },
-    "class_type": "SaveImageWebsocket",
+    "class_type": "PreviewImage",
     "_meta": {
-      "title": "Save Image WebSocket"
+      "title": "Preview Image"
     }
   },
   "10": {
     "inputs": {
-      "lora_name": "{{lora_name}}",
-      "strength_model": "{{lora_strength}}",
+      "lora_name": "placeholder.safetensors",
+      "strength_model": 1,
       "model": [
         "5",
         0
@@ -138,7 +138,7 @@
     },
     "class_type": "LoraLoaderModelOnly",
     "_meta": {
-      "title": "Load LoRA (Model Only)"
+      "title": "AITK_LORA"
     }
   }
 }
